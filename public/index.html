@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Grok Voice Streaming Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui; background: #0d0e10; color: #e4e6eb; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; font-weight: 500; letter-spacing: .02em; color: #aab; margin-bottom: 1rem; }
+  textarea { width: 100%; min-height: 80px; background: #16181c; color: inherit; border: 1px solid #2a2d33; border-radius: 6px; padding: .6rem; font: inherit; resize: vertical; }
+  .row { display: flex; gap: .5rem; align-items: center; margin: .6rem 0; }
+  select, button { background: #16181c; color: inherit; border: 1px solid #2a2d33; border-radius: 6px; padding: .45rem .8rem; font: inherit; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #3a6df0; border-color: #3a6df0; }
+  #output { margin-top: 1rem; padding: 1rem; background: #16181c; border: 1px solid #2a2d33; border-radius: 6px; min-height: 120px; white-space: pre-wrap; font-family: ui-monospace, monospace; }
+  .sentence { background: rgba(58,109,240,.15); transition: background .8s; }
+  .played { background: transparent; }
+  .meta { color: #788; font-size: 12px; margin-top: .4rem; }
+  .err { color: #f57; }
+</style>
+</head>
+<body>
+<h1>Grok streaming TTS demo · <a href="/realtime.html" style="color:#6cf">switch to realtime WSS →</a></h1>
+
+<textarea id="prompt" placeholder="Ask Grok something...">Tell me a short ghost story. Whisper the scary parts.</textarea>
+<div class="meta">Tip: ask for jokes, secrets, or dramatic moments — Grok adds [pause], [laugh], &lt;whisper&gt; tags inline.</div>
+
+<div class="row">
+  <label for="voice">Voice</label>
+  <select id="voice">
+    <option value="eve">eve (female, energetic)</option>
+    <option value="ara">ara (female, warm)</option>
+    <option value="rex">rex (male, professional)</option>
+    <option value="sal">sal (neutral, smooth)</option>
+    <option value="leo">leo (male, authoritative)</option>
+  </select>
+  <button id="go" class="primary">Stream text</button>
+  <button id="mic">🎙 Hold to talk</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+<div class="meta" id="transcript"></div>
+
+<div id="output"></div>
+<div class="meta" id="meta"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const out = $('output'), meta = $('meta');
+let ctrl = null;
+const audioQueue = [];
+let playing = false;
+
+async function playNext() {
+  if (playing) return;
+  const item = audioQueue.shift();
+  if (!item) return;
+  playing = true;
+  try {
+    const r = await fetch('/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: item.text, voice: item.voice }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      meta.innerHTML = `<span class="err">TTS ${r.status}: ${t}</span>`;
+      playing = false;
+      return playNext();
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.addEventListener('ended', () => {
+      URL.revokeObjectURL(url);
+      item.el?.classList.add('played');
+      playing = false;
+      playNext();
+    });
+    audio.addEventListener('error', () => {
+      playing = false;
+      playNext();
+    });
+    await audio.play();
+  } catch (e) {
+    playing = false;
+    meta.innerHTML = `<span class="err">${e.message}</span>`;
+    playNext();
+  }
+}
+
+function enqueue(text, voice) {
+  const el = document.createElement('span');
+  el.className = 'sentence';
+  el.textContent = text + ' ';
+  out.appendChild(el);
+  audioQueue.push({ text, voice, el });
+  playNext();
+}
+
+$('go').onclick = async () => {
+  out.textContent = '';
+  meta.textContent = '';
+  audioQueue.length = 0;
+  playing = false;
+  $('go').disabled = true; $('stop').disabled = false;
+
+  ctrl = new AbortController();
+  const t0 = performance.now();
+  let firstAudio = null;
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: $('prompt').value, voice: $('voice').value }),
+      signal: ctrl.signal,
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let pendingTextNode = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) !== -1) {
+        const block = buf.slice(0, i); buf = buf.slice(i + 2);
+        const ev = /event: (\w+)/.exec(block)?.[1];
+        const data = /data: (.+)/.exec(block)?.[1];
+        if (!ev || !data) continue;
+        const j = JSON.parse(data);
+        if (ev === 'text') {
+          // streaming token preview before sentence flush
+        } else if (ev === 'sentence') {
+          if (firstAudio === null) firstAudio = performance.now() - t0;
+          enqueue(j.text, j.voice);
+          meta.textContent = `first sentence in ${firstAudio.toFixed(0)}ms · queued ${audioQueue.length + (playing?1:0)}`;
+        } else if (ev === 'error') {
+          meta.innerHTML = `<span class="err">chat ${j.status}: ${j.body}</span>`;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') meta.innerHTML = `<span class="err">${e.message}</span>`;
+  } finally {
+    $('go').disabled = false; $('stop').disabled = true;
+  }
+};
+
+$('stop').onclick = () => { ctrl?.abort(); audioQueue.length = 0; };
+
+let recorder = null, recChunks = [];
+async function startRec() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime });
+  recChunks = [];
+  recorder.ondataavailable = e => e.data.size && recChunks.push(e.data);
+  recorder.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    const blob = new Blob(recChunks, { type: mime });
+    $('transcript').textContent = 'transcribing...';
+    const t0 = performance.now();
+    const r = await fetch('/stt', { method: 'POST', headers: { 'Content-Type': mime }, body: blob });
+    if (!r.ok) { $('transcript').innerHTML = `<span class="err">stt ${r.status}: ${await r.text()}</span>`; return; }
+    const j = await r.json();
+    const dur = (performance.now() - t0).toFixed(0);
+    const text = j.text || j.transcript || JSON.stringify(j);
+    $('transcript').textContent = `transcribed in ${dur}ms: "${text}"`;
+    $('prompt').value = text;
+    $('go').click();
+  };
+  recorder.start();
+  $('mic').textContent = '● recording (release to send)';
+  $('mic').classList.add('primary');
+}
+function stopRec() {
+  if (recorder?.state === 'recording') recorder.stop();
+  $('mic').textContent = '🎙 Hold to talk';
+  $('mic').classList.remove('primary');
+}
+const micBtn = $('mic');
+micBtn.addEventListener('mousedown', startRec);
+micBtn.addEventListener('mouseup', stopRec);
+micBtn.addEventListener('mouseleave', stopRec);
+micBtn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
+micBtn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
+</script>
+</body>
+</html>

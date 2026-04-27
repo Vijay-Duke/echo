@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.*
+*.env
+secrets.json
+keys.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Swift / SPM build outputs
+mac/.build/
+mac/Package.resolved.bak
+DerivedData/
+
+# Built app bundles (we ship the .dmg, not the unpackaged .app)
+mac/Echo.app/
+mac/VoiceGrok.app/
+
+# macOS junk
+.DS_Store
+*.swp
+
+# Editor
+.idea/
+.vscode/
+*.iml
+
+# Claude / agent caches
+.claude-mem/
+.claude/

@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Gemini 2.5 Flash Native Audio</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui; background: #0d0e10; color: #e4e6eb; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; font-weight: 500; letter-spacing: .02em; color: #aab; margin-bottom: 1rem; }
+  .row { display: flex; gap: .5rem; align-items: center; margin: .6rem 0; flex-wrap: wrap; }
+  select, button, textarea { background: #16181c; color: inherit; border: 1px solid #2a2d33; border-radius: 6px; padding: .45rem .8rem; font: inherit; }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #3a6df0; border-color: #3a6df0; }
+  button.danger { background: #d04848; border-color: #d04848; }
+  #log { margin-top: 1rem; padding: 1rem; background: #16181c; border: 1px solid #2a2d33; border-radius: 6px; min-height: 160px; max-height: 60vh; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+  .user { color: #6cf; }
+  .asst { color: #fb6; }
+  .sys { color: #788; }
+  .err { color: #f57; }
+  .meta { color: #788; font-size: 12px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #2a2d33; font-size: 11px; margin-left: .4rem; }
+  .pill.live { background: #2a8050; color: #cfe; }
+  a { color: #6cf; }
+</style>
+</head>
+<body>
+<h1>Gemini 2.5 Flash native audio <span id="state" class="pill">idle</span></h1>
+<div class="meta">Gemini Live API v1alpha · 16kHz in / 24kHz out PCM · <a href="/realtime.html">grok realtime</a> · <a href="/">pipeline</a></div>
+
+<div class="row">
+  <label>Model</label>
+  <select id="model">
+    <option value="models/gemini-2.5-flash-native-audio-latest">2.5 flash native audio (latest)</option>
+    <option value="models/gemini-2.5-flash-native-audio-preview-12-2025">2.5 flash native audio (12-2025)</option>
+    <option value="models/gemini-2.5-flash-native-audio-preview-09-2025">2.5 flash native audio (09-2025)</option>
+    <option value="models/gemini-3.1-flash-live-preview">3.1 flash live preview</option>
+  </select>
+  <label>Voice</label>
+  <select id="voice">
+    <option value="Aoede">Aoede</option>
+    <option value="Charon">Charon</option>
+    <option value="Fenrir">Fenrir</option>
+    <option value="Kore">Kore</option>
+    <option value="Puck">Puck</option>
+  </select>
+  <label>VAD</label>
+  <select id="vad">
+    <option value="auto">server VAD (default)</option>
+    <option value="low">server VAD low sens</option>
+    <option value="silero">client Silero VAD</option>
+    <option value="ptt">push-to-talk</option>
+  </select>
+  <button id="connect" class="primary">Connect</button>
+  <button id="hangup" class="danger" disabled>Hang up</button>
+  <span class="meta" id="timer"></span>
+</div>
+<div class="row" id="pttRow" style="display:none">
+  <button id="ptt" class="primary" style="flex:1; padding: 1rem">🎙 Hold to talk</button>
+</div>
+<div class="meta" id="caps">2.5 native audio supports emotion · 3.1 flash live does not</div>
+
+<textarea id="instructions">You are a witty, expressive voice assistant. Match the user's emotional tone — laugh when something is funny, drop your voice for serious or scary moments, sound excited for good news. Keep replies short and conversational.</textarea>
+
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = $('log'), state = $('state'), timer = $('timer');
+function add(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+function setState(s, live=false) { state.textContent = s; state.classList.toggle('live', live); }
+
+let ws = null, audioCtx = null, micNode = null, micStream = null;
+let nextStart = 0, t0 = 0, timerInt = 0, asstLine = null;
+let activeSources = [];
+let pttActive = false;
+let vadSpeaking = false, sileroVad = null;
+let inSeconds = 0, outSeconds = 0;
+const RATE_IN_PER_MIN = 0.005;
+const RATE_OUT_PER_MIN = 0.018;
+
+function b64ToBytes(b64) { const bin = atob(b64); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
+function bytesToB64(bytes) { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s); }
+
+function cutPlayback() {
+  for (const s of activeSources) { try { s.stop(); } catch {} }
+  activeSources = [];
+  nextStart = audioCtx ? audioCtx.currentTime : 0;
+}
+
+function playPcm16(bytes, rate=24000) {
+  const i16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 0x8000;
+  const buf = audioCtx.createBuffer(1, f32.length, rate);
+  buf.getChannelData(0).set(f32);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const start = Math.max(audioCtx.currentTime, nextStart);
+  src.start(start);
+  nextStart = start + buf.duration;
+  activeSources.push(src);
+  src.onended = () => { activeSources = activeSources.filter(s => s !== src); };
+}
+
+function vadConfig() {
+  const v = $('vad').value;
+  if (v === 'ptt' || v === 'silero') return { automaticActivityDetection: { disabled: true } };
+  if (v === 'low') return {
+    automaticActivityDetection: {
+      disabled: false,
+      startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+      endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+      prefixPaddingMs: 200,
+      silenceDurationMs: 800,
+    },
+  };
+  return { automaticActivityDetection: { disabled: false } };
+}
+
+async function connect() {
+  $('connect').disabled = true;
+  setState('connecting');
+
+  ws = new WebSocket(`ws://${location.host}/gemini`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    setState('configuring');
+    const model = $('model').value;
+    const setup = {
+      model,
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: $('voice').value } },
+          languageCode: 'en-US',
+        },
+      },
+      systemInstruction: { parts: [{ text: $('instructions').value }] },
+      realtimeInputConfig: vadConfig(),
+      outputAudioTranscription: {},
+      inputAudioTranscription: {},
+    };
+    add('sys', `[setup model=${model.split('/').pop()} vad=${$('vad').value}]`);
+    ws.send(JSON.stringify({ setup }));
+  };
+
+  ws.onmessage = async (ev) => {
+    let raw = ev.data;
+    if (raw instanceof ArrayBuffer) raw = new TextDecoder().decode(raw);
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    console.log('[gemini]', msg);
+    if (msg.proxyError) { add('err', `proxy: ${msg.proxyError}`); return; }
+    if (msg.setupComplete) {
+      add('sys', '[setup complete]');
+      await startMic();
+      setState('live', true);
+      $('hangup').disabled = false;
+      t0 = Date.now();
+      inSeconds = 0; outSeconds = 0;
+      timerInt = setInterval(() => {
+        const s = Math.floor((Date.now() - t0) / 1000);
+        const cost = (inSeconds/60)*RATE_IN_PER_MIN + (outSeconds/60)*RATE_OUT_PER_MIN;
+        timer.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')} · in ${inSeconds.toFixed(1)}s out ${outSeconds.toFixed(1)}s · $${cost.toFixed(4)}`;
+      }, 500);
+      return;
+    }
+
+    if (msg.serverContent) {
+      const sc = msg.serverContent;
+
+      if (sc.interrupted) {
+        add('sys', '[interrupted by you]');
+        cutPlayback();
+      }
+
+      if (sc.inputTranscription?.text) {
+        add('user', `you: ${sc.inputTranscription.text}`);
+      }
+
+      if (sc.outputTranscription?.text) {
+        if (!asstLine) {
+          asstLine = document.createElement('div');
+          asstLine.className = 'asst'; asstLine.textContent = 'gemini: ';
+          log.appendChild(asstLine);
+        }
+        asstLine.textContent += sc.outputTranscription.text;
+        log.scrollTop = log.scrollHeight;
+      }
+
+      const parts = sc.modelTurn?.parts || [];
+      for (const p of parts) {
+        const inline = p.inlineData;
+        if (!inline) continue;
+        const mt = inline.mimeType || '';
+        const m = /rate=(\d+)/.exec(mt);
+        const rate = m ? Number(m[1]) : 24000;
+        const bytes = b64ToBytes(inline.data);
+        outSeconds += bytes.byteLength / 2 / rate;
+        playPcm16(bytes, rate);
+      }
+
+      if (sc.turnComplete) {
+        asstLine = null;
+      }
+      return;
+    }
+
+    if (msg.toolCall) { add('sys', `[tool call] ${JSON.stringify(msg.toolCall).slice(0,200)}`); return; }
+    if (msg.error) { add('err', `error: ${JSON.stringify(msg.error)}`); return; }
+  };
+
+  ws.onclose = (e) => { add('sys', `[ws closed ${e.code} ${e.reason||''}]`); hangup(); setState('closed'); };
+  ws.onerror = () => add('err', 'ws error');
+}
+
+async function startMic() {
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+  await audioCtx.audioWorklet.addModule('/capture-worklet.js');
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  const src = audioCtx.createMediaStreamSource(micStream);
+  micNode = new AudioWorkletNode(audioCtx, 'capture', { processorOptions: { targetRate: 16000 } });
+  const isPtt = $('vad').value === 'ptt';
+  micNode.port.onmessage = e => {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    if (isPtt && !pttActive) return;
+    if ($('vad').value === 'silero' && !vadSpeaking) return;
+    const bytes = new Uint8Array(e.data);
+    inSeconds += bytes.byteLength / 2 / 16000;
+    ws.send(JSON.stringify({
+      realtimeInput: {
+        audio: {
+          mimeType: 'audio/pcm;rate=16000',
+          data: bytesToB64(bytes),
+        },
+      },
+    }));
+  };
+  src.connect(micNode);
+
+  if ($('vad').value === 'silero') {
+    add('sys', '[loading Silero VAD model...]');
+    const { MicVAD } = await import('https://esm.sh/@ricky0123/vad-web@0.0.24');
+    sileroVad = await MicVAD.new({
+      stream: micStream,
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      redemptionFrames: 12,
+      preSpeechPadFrames: 3,
+      onSpeechStart: () => {
+        vadSpeaking = true;
+        cutPlayback();
+        add('sys', '[silero: speech start → activityStart]');
+        try { ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } })); } catch {}
+      },
+      onSpeechEnd: () => {
+        vadSpeaking = false;
+        add('sys', '[silero: speech end → activityEnd]');
+        try { ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } })); } catch {}
+      },
+      onVADMisfire: () => add('sys', '[silero: misfire]'),
+    });
+    sileroVad.start();
+    add('sys', '[silero ready]');
+  }
+
+  if (isPtt) {
+    $('pttRow').style.display = 'flex';
+    const btn = $('ptt');
+    const start = () => {
+      pttActive = true;
+      cutPlayback();
+      try { ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } })); } catch {}
+      btn.textContent = '● recording (release to send)';
+    };
+    const stop = () => {
+      if (!pttActive) return;
+      pttActive = false;
+      try { ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } })); } catch {}
+      btn.textContent = '🎙 Hold to talk';
+    };
+    btn.onmousedown = start;
+    btn.onmouseup = stop;
+    btn.onmouseleave = stop;
+    btn.ontouchstart = e => { e.preventDefault(); start(); };
+    btn.ontouchend = e => { e.preventDefault(); stop(); };
+  } else {
+    $('pttRow').style.display = 'none';
+  }
+}
+
+function hangup() {
+  clearInterval(timerInt);
+  $('connect').disabled = false; $('hangup').disabled = true;
+  setState('idle');
+  try { sileroVad?.destroy(); } catch {}
+  try { ws?.close(); } catch {}
+  try { micStream?.getTracks().forEach(t => t.stop()); } catch {}
+  try { audioCtx?.close(); } catch {}
+  ws = null; micStream = null; audioCtx = null; micNode = null; sileroVad = null;
+  vadSpeaking = false; pttActive = false;
+}
+
+$('connect').onclick = () => connect().catch(e => { add('err', e.message); $('connect').disabled = false; });
+$('hangup').onclick = hangup;
+</script>
+</body>
+</html>

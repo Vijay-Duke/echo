@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Grok Realtime Voice</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui; background: #0d0e10; color: #e4e6eb; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; font-weight: 500; letter-spacing: .02em; color: #aab; margin-bottom: 1rem; }
+  .row { display: flex; gap: .5rem; align-items: center; margin: .6rem 0; flex-wrap: wrap; }
+  select, button, textarea { background: #16181c; color: inherit; border: 1px solid #2a2d33; border-radius: 6px; padding: .45rem .8rem; font: inherit; }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #3a6df0; border-color: #3a6df0; }
+  button.danger { background: #d04848; border-color: #d04848; }
+  #log { margin-top: 1rem; padding: 1rem; background: #16181c; border: 1px solid #2a2d33; border-radius: 6px; min-height: 160px; max-height: 60vh; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+  .user { color: #6cf; }
+  .asst { color: #fb6; }
+  .sys { color: #788; }
+  .err { color: #f57; }
+  .meta { color: #788; font-size: 12px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #2a2d33; font-size: 11px; margin-left: .4rem; }
+  .pill.live { background: #2a8050; color: #cfe; }
+  a { color: #6cf; }
+</style>
+</head>
+<body>
+<h1>Grok realtime voice <span id="state" class="pill">idle</span></h1>
+<div class="meta">Model <code>grok-voice-think-fast-1.0</code> · WSS · 24kHz PCM16 · server VAD · ~$3/hr · <a href="/gemini.html">gemini live →</a> · <a href="/">pipeline</a></div>
+
+<div class="row">
+  <label>Voice</label>
+  <select id="voice">
+    <option value="eve">eve</option><option value="ara">ara</option><option value="rex">rex</option><option value="sal">sal</option><option value="leo">leo</option>
+  </select>
+  <label>VAD</label>
+  <select id="vad">
+    <option value="auto">server VAD (default)</option>
+    <option value="low">server VAD low sens</option>
+    <option value="silero">client Silero VAD</option>
+    <option value="ptt">push-to-talk</option>
+  </select>
+  <button id="connect" class="primary">Connect</button>
+  <button id="hangup" class="danger" disabled>Hang up</button>
+  <span class="meta" id="timer"></span>
+</div>
+<div class="row" id="pttRow" style="display:none">
+  <button id="ptt" class="primary" style="flex:1; padding: 1rem">🎙 Hold to talk</button>
+</div>
+
+<textarea id="instructions">You are a witty, expressive voice assistant. Use natural pacing, laugh when something is funny, whisper for dramatic moments. Keep replies short and conversational.</textarea>
+
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = $('log'), state = $('state'), timer = $('timer');
+function add(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+function setState(s, live=false) { state.textContent = s; state.classList.toggle('live', live); }
+
+let ws = null, audioCtx = null, micNode = null, micStream = null;
+let nextStart = 0, t0 = 0, timerInt = 0, asstLine = null, userLine = null;
+let activeSources = [];
+let dropAudio = false;
+let pttActive = false, vadSpeaking = false, sileroVad = null;
+let responseActive = false;
+
+function maybeCancel() {
+  if (!responseActive) return;
+  try { ws.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+}
+
+function turnDetection() {
+  const v = $('vad').value;
+  if (v === 'ptt' || v === 'silero') return null;
+  if (v === 'low') return { type: 'server_vad', threshold: 0.5, silence_duration_ms: 800, prefix_padding_ms: 200 };
+  return { type: 'server_vad' };
+}
+
+function commitTurn() {
+  try {
+    ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    ws.send(JSON.stringify({ type: 'response.create' }));
+  } catch {}
+}
+
+function cutPlayback() {
+  for (const s of activeSources) { try { s.stop(); } catch {} }
+  activeSources = [];
+  nextStart = audioCtx ? audioCtx.currentTime : 0;
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function playPcm16(bytes) {
+  const i16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 0x8000;
+  const buf = audioCtx.createBuffer(1, f32.length, 24000);
+  buf.getChannelData(0).set(f32);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const start = Math.max(audioCtx.currentTime, nextStart);
+  src.start(start);
+  nextStart = start + buf.duration;
+  activeSources.push(src);
+  src.onended = () => { activeSources = activeSources.filter(s => s !== src); };
+}
+
+async function connect() {
+  $('connect').disabled = true;
+  setState('minting token');
+
+  const tokRes = await fetch('/session', { method: 'POST' });
+  if (!tokRes.ok) {
+    add('err', `session ${tokRes.status}: ${await tokRes.text()}`);
+    $('connect').disabled = false; setState('error');
+    return;
+  }
+  const { value: token } = await tokRes.json();
+
+  setState('connecting');
+  ws = new WebSocket(
+    'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-1.0',
+    ['xai-client-secret.' + token],
+  );
+
+  ws.onopen = async () => {
+    setState('configuring');
+    ws.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        voice: $('voice').value,
+        instructions: $('instructions').value,
+        turn_detection: turnDetection(),
+        audio: {
+          input: { format: { type: 'audio/pcm', rate: 24000 } },
+          output: { format: { type: 'audio/pcm', rate: 24000 } },
+        },
+      },
+    }));
+    await startMic();
+    setState('live', true);
+    $('hangup').disabled = false;
+    t0 = Date.now();
+    timerInt = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      timer.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')} · est $${(s/60*0.05).toFixed(3)}`;
+    }, 500);
+  };
+
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    switch (msg.type) {
+      case 'session.created': add('sys', `[session created]`); break;
+      case 'session.updated': add('sys', `[session configured: ${$('voice').value}]`); break;
+      case 'input_audio_buffer.speech_started':
+        if ($('vad').value !== 'auto' && $('vad').value !== 'low') break;
+        userLine = null;
+        add('sys', '[you started speaking — barge-in]');
+        dropAudio = true;
+        cutPlayback();
+        maybeCancel();
+        break;
+      case 'input_audio_buffer.speech_stopped':
+        add('sys', '[you stopped]');
+        break;
+      case 'conversation.item.input_audio_transcription.completed':
+        add('user', `you: ${msg.transcript}`);
+        break;
+      case 'response.output_audio_transcript.delta':
+      case 'response.text.delta': {
+        const delta = msg.delta || '';
+        if (!asstLine) {
+          asstLine = document.createElement('div');
+          asstLine.className = 'asst'; asstLine.textContent = 'grok: ';
+          log.appendChild(asstLine);
+        }
+        asstLine.textContent += delta;
+        log.scrollTop = log.scrollHeight;
+        break;
+      }
+      case 'response.output_audio.delta':
+        if (dropAudio) break;
+        playPcm16(b64ToBytes(msg.delta));
+        break;
+      case 'response.created':
+        dropAudio = false;
+        responseActive = true;
+        break;
+      case 'response.done':
+        asstLine = null;
+        dropAudio = false;
+        responseActive = false;
+        break;
+      case 'error':
+        add('err', `error: ${JSON.stringify(msg.error || msg)}`);
+        break;
+    }
+  };
+
+  ws.onclose = () => { hangup(); setState('closed'); };
+  ws.onerror = e => add('err', `ws error: ${e.message || ''}`);
+}
+
+async function startMic() {
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+  await audioCtx.audioWorklet.addModule('/capture-worklet.js');
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  const src = audioCtx.createMediaStreamSource(micStream);
+  micNode = new AudioWorkletNode(audioCtx, 'capture', { processorOptions: { targetRate: 24000 } });
+  const mode = $('vad').value;
+  micNode.port.onmessage = e => {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    if (mode === 'ptt' && !pttActive) return;
+    if (mode === 'silero' && !vadSpeaking) return;
+    ws.send(JSON.stringify({
+      type: 'input_audio_buffer.append',
+      audio: bytesToB64(new Uint8Array(e.data)),
+    }));
+  };
+  src.connect(micNode);
+
+  if (mode === 'silero') {
+    add('sys', '[loading Silero VAD model...]');
+    const { MicVAD } = await import('https://esm.sh/@ricky0123/vad-web@0.0.24');
+    sileroVad = await MicVAD.new({
+      stream: micStream,
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      redemptionFrames: 12,
+      preSpeechPadFrames: 3,
+      onSpeechStart: () => {
+        vadSpeaking = true;
+        dropAudio = true;
+        cutPlayback();
+        maybeCancel();
+        add('sys', '[silero: speech start]');
+      },
+      onSpeechEnd: () => {
+        vadSpeaking = false;
+        add('sys', '[silero: speech end → commit + response.create]');
+        commitTurn();
+      },
+    });
+    sileroVad.start();
+    add('sys', '[silero ready]');
+  }
+
+  if (mode === 'ptt') {
+    $('pttRow').style.display = 'flex';
+    const btn = $('ptt');
+    const start = () => {
+      pttActive = true;
+      dropAudio = true;
+      cutPlayback();
+      maybeCancel();
+      try { ws.send(JSON.stringify({ type: 'input_audio_buffer.clear' })); } catch {}
+      btn.textContent = '● recording (release to send)';
+    };
+    const stop = () => {
+      if (!pttActive) return;
+      pttActive = false;
+      btn.textContent = '🎙 Hold to talk';
+      commitTurn();
+    };
+    btn.onmousedown = start;
+    btn.onmouseup = stop;
+    btn.onmouseleave = stop;
+    btn.ontouchstart = e => { e.preventDefault(); start(); };
+    btn.ontouchend = e => { e.preventDefault(); stop(); };
+  } else {
+    $('pttRow').style.display = 'none';
+  }
+}
+
+function hangup() {
+  clearInterval(timerInt);
+  $('connect').disabled = false; $('hangup').disabled = true;
+  setState('idle');
+  try { sileroVad?.destroy(); } catch {}
+  try { ws?.close(); } catch {}
+  try { micStream?.getTracks().forEach(t => t.stop()); } catch {}
+  try { audioCtx?.close(); } catch {}
+  ws = null; micStream = null; audioCtx = null; micNode = null; sileroVad = null;
+  vadSpeaking = false; pttActive = false;
+}
+
+$('connect').onclick = () => connect().catch(e => { add('err', e.message); $('connect').disabled = false; });
+$('hangup').onclick = hangup;
+</script>
+</body>
+</html>
