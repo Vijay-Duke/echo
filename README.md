@@ -130,4 +130,4 @@ API protocol revision.
 
 ## License
 
-Private.
+[MIT](LICENSE) — do whatever, no warranty.
