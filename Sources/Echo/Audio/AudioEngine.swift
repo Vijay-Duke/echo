@@ -166,6 +166,10 @@ final class AudioEngine: @unchecked Sendable {
         self.onFloatFrame = onFloatFrame
         self.onLevel = onLevel
         self.isBroadcasting = true
+        // Reset mute. Otherwise a session that ended while muted (e.g. server
+        // emitted .speaking but never .listening before we tore down on .idle)
+        // would leave the next press silently dropping every chunk.
+        self._micMuted = false
         stateLock.unlock()
         captureQueue.async { [weak self] in self?.captureAcc.removeAll(keepingCapacity: true) }
     }

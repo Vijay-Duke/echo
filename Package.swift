@@ -27,5 +27,10 @@ let package = Package(
                 .process("Resources"),
             ]
         ),
+        .testTarget(
+            name: "EchoTests",
+            dependencies: ["Echo"],
+            path: "Tests/EchoTests"
+        ),
     ]
 )

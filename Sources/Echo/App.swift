@@ -347,15 +347,13 @@ final class AppController: ObservableObject {
                     NSLog("[VG] state→%{public}@", String(describing: s))
                     await MainActor.run {
                         self.setState(s)
-                        // Mute mic during assistant playback to avoid sending
-                        // speaker bleed back as user audio (which would bill).
-                        // AEC reduces echo but is not a billing guard. Energy-
-                        // based barge-in temporarily un-mutes via cutPlayback.
+                        // Mute mic only while assistant is speaking (speaker
+                        // bleed would bill as user audio). Any other state
+                        // unmutes so the next user turn isn't silently dropped.
                         if case .speaking = s {
                             self.sessionHasResponded = true
                             self.audio.setMicMuted(true)
-                        }
-                        if case .listening = s {
+                        } else {
                             self.audio.setMicMuted(false)
                         }
                         // Auto-end the session only after we've seen at least
