@@ -5,18 +5,20 @@
 secrets.json
 keys.json
 
-# Node
+# Node (web demo)
+web-demo/node_modules/
 node_modules/
 npm-debug.log*
 
 # Swift / SPM build outputs
-mac/.build/
-mac/Package.resolved.bak
+.build/
 DerivedData/
+Package.resolved.bak
 
-# Built app bundles (we ship the .dmg, not the unpackaged .app)
-mac/Echo.app/
-mac/VoiceGrok.app/
+# Built artifacts (don't ship in git — use GitHub Releases)
+Echo.app/
+Echo.dmg
+*.dmg
 
 # macOS junk
 .DS_Store

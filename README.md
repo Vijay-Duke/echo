@@ -41,11 +41,12 @@ you never bill for speaker bleed.
 
 ## Install
 
-1. Download [`mac/Echo.dmg`](mac/Echo.dmg).
+1. Download the latest `Echo.dmg` from
+   [Releases](https://github.com/Vijay-Duke/echo/releases/latest).
 2. Open it, drag **Echo** → **Applications**.
 3. Launch Echo. macOS will prompt for **microphone** permission — accept.
 4. Open **Echo Settings** (menu-bar icon → *Open Settings…*) and paste your API
-   keys. Or seed them from a `.env` file with `mac/seed-keys.sh`.
+   keys. Or seed them from a `.env` file with `./seed-keys.sh`.
 5. Hold the configured hotkey and start talking.
 
 The first time you use a profile with output **Paste at cursor** or
@@ -74,16 +75,19 @@ function keys also work.
 ## Repo layout
 
 ```
-mac/                   Swift Package + Echo.app build
-  Sources/Echo/        SwiftUI app, providers, audio engine, VAD
-  Resources/           Info.plist, AppIcon.icns, Silero ONNX
-  build-app.sh         Builds .app bundle, copies SPM resource bundles, ad-hoc signs
-  seed-keys.sh         Reads ../.env and seeds keys into Keychain
-  Echo.dmg             Pre-built drag-install disk image (current main)
-public/                Web demo: STT/chat/TTS pipeline, Grok realtime, Gemini Live
-server.js              Node proxy used by the web demos
+Sources/Echo/          SwiftUI app, providers, audio engine, VAD
+Resources/             Info.plist, AppIcon.icns
+Package.swift          Swift Package manifest
+build-app.sh           Builds Echo.app, copies SPM resource bundles, ad-hoc signs
+seed-keys.sh           Reads ./.env and seeds keys into Keychain
+branding/              Source artwork (icns + PNG sizes)
 assets/                Icons used in this README
+web-demo/              Browser demos: STT/chat/TTS pipeline, Grok realtime, Gemini Live
+                       (server.js + public/, separate from the Mac app)
 ```
+
+Built artifacts (`Echo.app`, `Echo.dmg`, `.build/`) are gitignored — the .dmg
+ships via [GitHub Releases](https://github.com/Vijay-Duke/echo/releases).
 
 ## Architecture (very short version)
 
@@ -105,7 +109,6 @@ assets/                Icons used in this README
 Requires macOS 14+, Xcode 15+ command-line tools, Swift 5.10.
 
 ```bash
-cd mac
 swift build                 # SPM build
 ./build-app.sh              # bundles Echo.app + ad-hoc codesign
 open Echo.app
@@ -114,7 +117,6 @@ open Echo.app
 To rebuild the .dmg:
 
 ```bash
-cd mac
 STAGE=$(mktemp -d)
 cp -R Echo.app "$STAGE/" && ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname Echo -srcfolder "$STAGE" -ov -format UDZO -quiet Echo.dmg

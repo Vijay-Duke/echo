@@ -3,7 +3,7 @@
 # Reads from ../.env so you don't have to retype keys.
 set -euo pipefail
 
-ENV_FILE="$(dirname "$0")/../.env"
+ENV_FILE="$(dirname "$0")/.env"
 SERVICE="com.echo"
 
 source "$ENV_FILE"
