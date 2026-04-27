@@ -214,7 +214,6 @@ final class VadGate: @unchecked Sendable {
             NSLog("[VadGate] prob=%.3f speaking=%d", prob, _isSpeaking ? 1 : 0)
         }
         lock.lock()
-        let wasSpeaking = _isSpeaking
         var fireStart = false
         var fireEnd = false
 
@@ -237,7 +236,6 @@ final class VadGate: @unchecked Sendable {
             // Between thresholds: if speaking, treat as ambiguous (no counter bump).
             if !_isSpeaking { silenceCounter = 0 }
         }
-        _ = wasSpeaking
         lock.unlock()
 
         if fireStart { onEvent?(.speechStart) }

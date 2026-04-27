@@ -200,8 +200,31 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
         if let err = obj["error"] {
             yielder.yield(.error("gemini: \(err)"))
         }
-        // usageMetadata, sessionResumptionUpdate: parsed but not surfaced beyond cost tracking.
-        _ = obj["usageMetadata"]
+        // usageMetadata is the authoritative billing source (server-side token
+        // counts). Replaces the local time-based estimate so cost cap is exact.
+        if let usage = obj["usageMetadata"] as? [String: Any] {
+            // Token counts are split by modality; Gemini Live tokens for audio
+            // map ~32 tokens/second of audio in/out. Convert to seconds for the
+            // existing rate card. If `responseTokenCount` is split per modality,
+            // honor that; otherwise fall back to total.
+            var newIn: Double = inputSeconds
+            var newOut: Double = outputSeconds
+            if let promptDetails = usage["promptTokensDetails"] as? [[String: Any]] {
+                for d in promptDetails where (d["modality"] as? String) == "AUDIO" {
+                    if let n = d["tokenCount"] as? Int { newIn = Double(n) / 32.0 }
+                }
+            }
+            if let respDetails = usage["responseTokensDetails"] as? [[String: Any]] {
+                for d in respDetails where (d["modality"] as? String) == "AUDIO" {
+                    if let n = d["tokenCount"] as? Int { newOut = Double(n) / 32.0 }
+                }
+            }
+            if newIn != inputSeconds || newOut != outputSeconds {
+                inputSeconds = newIn
+                outputSeconds = newOut
+                yielder.yield(.costUpdate(inputSeconds: inputSeconds, outputSeconds: outputSeconds))
+            }
+        }
         _ = obj["sessionResumptionUpdate"]
     }
 

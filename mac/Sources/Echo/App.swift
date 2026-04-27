@@ -347,11 +347,17 @@ final class AppController: ObservableObject {
                     NSLog("[VG] state→%{public}@", String(describing: s))
                     await MainActor.run {
                         self.setState(s)
-                        // Mic stays open during .speaking so the user (and the
-                        // server VAD) can barge-in. Echo from speakers bleeding
-                        // into the mic is mitigated by AVAudioEngine voice
-                        // processing (AEC) — see AudioEngine.start.
-                        if case .speaking = s { self.sessionHasResponded = true }
+                        // Mute mic during assistant playback to avoid sending
+                        // speaker bleed back as user audio (which would bill).
+                        // AEC reduces echo but is not a billing guard. Energy-
+                        // based barge-in temporarily un-mutes via cutPlayback.
+                        if case .speaking = s {
+                            self.sessionHasResponded = true
+                            self.audio.setMicMuted(true)
+                        }
+                        if case .listening = s {
+                            self.audio.setMicMuted(false)
+                        }
                         // Auto-end the session only after we've seen at least
                         // one .speaking (i.e. a real response started). Without
                         // this guard the initial post-connect .listening would
@@ -438,19 +444,21 @@ final class AppController: ObservableObject {
         }
 
         // Start mic capture immediately (engine is prewarmed at app launch — this
-        // is sub-ms now) AND kick off WSS connect in parallel. Audio that arrives
-        // before connect completes is buffered into a small ring; flushed once
-        // connected. Hides ~150-300ms WSS handshake behind the first audio bytes.
-        let pendingChunks = AudioRingBuffer()
+        // is sub-ms now) AND kick off WSS connect in parallel. Pre-connect audio
+        // is dropped: server VAD discards leading silence anyway, but the bytes
+        // would still bill. Worth ~150ms of perceived "first phoneme" delay to
+        // not pay for ambient room noise on every press.
         let providerReady = ReadyFlag()
+        let mySessionGen = myGen
         audio.startSession(
             targetRate: micRate,
-            onCapture: { [weak provider, weak vadGate] pcm in
+            onCapture: { [weak provider, weak vadGate, weak self] pcm in
                 if let g = vadGate, !g.isSpeaking { return }
-                if providerReady.value, let provider = provider {
-                    Task { try? await provider.sendAudio(pcm) }
-                } else {
-                    pendingChunks.append(pcm)
+                guard providerReady.value, let provider = provider else { return }
+                // Stale-session guard: reject chunks queued before teardown.
+                Task { @MainActor in
+                    guard let self = self, self.sessionGen == mySessionGen else { return }
+                    try? await provider.sendAudio(pcm)
                 }
             },
             onFloatFrame: vadGate.map { gate in
@@ -481,12 +489,6 @@ final class AppController: ObservableObject {
                     return
                 }
 
-                // Flush any audio captured while WSS handshake was in flight.
-                let buffered = pendingChunks.drain()
-                if !buffered.isEmpty {
-                    NSLog("[VG] flushing %d buffered chunks", buffered.count)
-                    for pcm in buffered { try? await provider.sendAudio(pcm) }
-                }
                 providerReady.value = true
 
                 if profile.vad != .server && profile.vad != .silero {
@@ -503,33 +505,21 @@ final class AppController: ObservableObject {
     }
 
 
-    /// On hotkey release: stop the mic tap and (in manual VAD modes) tell the
-    /// provider the user turn is done. DO NOT disconnect — the assistant's
-    /// audio reply streams in *after* this point. Socket stays alive until
-    /// `response.done` (turnComplete) is observed, then we fully tear down.
+    /// On hotkey release: kill the session entirely. Fresh-per-press model —
+    /// no conversation memory carried over, no lingering open socket.
     private func deactivate(profile: Profile) {
         NSLog("[VG] deactivate profile=%{public}@", profile.name)
         activeProfileKeyHeld = false
         guard let active = activeProfile, active.id == profile.id else { return }
         let provider = currentProvider
 
-        let needsManualEnd: Bool
-        switch profile.vad {
-        case .server: needsManualEnd = false
-        case .silero: needsManualEnd = vadDidStartUtterance
-        case .off:    needsManualEnd = true
-        }
-
         currentVAD?.onEvent = nil
         currentVAD = nil
         vadDidStartUtterance = false
 
         audio.stopSession()
-        // Cut any in-flight assistant audio + cancel the in-flight response
-        // server-side. User releasing the key = "I'm done, kill it."
         audio.cutPlayback()
         Task { try? await provider?.interrupt() }
-        // End the session now — fresh next press, no memory.
         endSession()
     }
 
