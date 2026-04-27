@@ -82,8 +82,6 @@ build-app.sh           Builds Echo.app, copies SPM resource bundles, ad-hoc sign
 seed-keys.sh           Reads ./.env and seeds keys into Keychain
 branding/              Source artwork (icns + PNG sizes)
 assets/                Icons used in this README
-web-demo/              Browser demos: STT/chat/TTS pipeline, Grok realtime, Gemini Live
-                       (server.js + public/, separate from the Mac app)
 ```
 
 Built artifacts (`Echo.app`, `Echo.dmg`, `.build/`) are gitignored — the .dmg

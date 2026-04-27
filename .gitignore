@@ -5,8 +5,7 @@
 secrets.json
 keys.json
 
-# Node (web demo)
-web-demo/node_modules/
+# Node (legacy web-demo, removed from git)
 node_modules/
 npm-debug.log*
 
