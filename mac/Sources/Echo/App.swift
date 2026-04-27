@@ -587,9 +587,13 @@ final class AppController: ObservableObject {
     /// CGEvent.post silently no-ops, so the user still has the text on the
     /// clipboard and can paste manually.
     static func simulatePasteIfPossible() {
-        let trusted = AXIsProcessTrusted()
+        // `WithOptions([prompt: true])` triggers the system Accessibility prompt
+        // the first time we need it — without that, the check is silent and
+        // the user never knows they should grant the permission.
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        let trusted = AXIsProcessTrustedWithOptions(opts as CFDictionary)
         if !trusted {
-            NSLog("[VG] no Accessibility permission — text on clipboard, not auto-pasting")
+            NSLog("[VG] no Accessibility permission yet — text on clipboard, prompt shown")
             return
         }
         let src = CGEventSource(stateID: .combinedSessionState)
