@@ -32,6 +32,10 @@ struct EchoApp: App {
             AppDelegate.openSettings()
         }
 
+        Button("Show Walkthrough…") {
+            AppDelegate.openOnboarding()
+        }
+
         Divider()
 
         Button("Quit Echo") {
@@ -46,6 +50,7 @@ struct EchoApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     static let showDockIconKey = "showDockIcon.v1"
+    static let onboardingDoneKey = "onboarding.v1.completed"
 
     /// Strong owner of the controller. Created eagerly at init so it's never nil
     /// when the dock click handler runs. (Previously `AppController.shared` was
@@ -81,9 +86,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             KeychainStore.preloadAll()
         }
 
-        // Auto-open Settings on first launch so the user can configure things.
+        // First-launch onboarding. Subsequent launches go straight to Settings
+        // so the user can adjust without re-watching the walkthrough.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            Self.openSettings()
+            if defaults.bool(forKey: Self.onboardingDoneKey) {
+                Self.openSettings()
+            } else {
+                Self.openOnboarding()
+            }
         }
     }
 
@@ -136,6 +146,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         win.center()
         win.isReleasedWhenClosed = false
         settingsWindow = win
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    private static var onboardingWindow: NSWindow?
+
+    static func openOnboarding() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let win = onboardingWindow {
+            win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let view = OnboardingView(onFinish: {
+            UserDefaults.standard.set(true, forKey: onboardingDoneKey)
+            onboardingWindow?.close()
+            onboardingWindow = nil
+        })
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "Welcome to Echo"
+        win.styleMask = [.titled, .closable]
+        win.setContentSize(NSSize(width: 540, height: 480))
+        win.center()
+        win.isReleasedWhenClosed = false
+        onboardingWindow = win
         win.makeKeyAndOrderFront(nil)
     }
 
