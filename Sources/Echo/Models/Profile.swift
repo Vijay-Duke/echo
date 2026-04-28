@@ -64,6 +64,7 @@ struct Profile: Codable, Identifiable, Equatable, Hashable {
     var injectClipboard: Bool
     var costCapUSD: Double?
     var enabled: Bool
+    var webSearchEnabled: Bool?
 
     static func defaultGemini() -> Profile {
         Profile(
@@ -78,7 +79,8 @@ struct Profile: Codable, Identifiable, Equatable, Hashable {
             output: .speak,
             injectClipboard: false,
             costCapUSD: 0.50,
-            enabled: true
+            enabled: true,
+            webSearchEnabled: false
         )
     }
 }

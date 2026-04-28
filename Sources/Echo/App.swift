@@ -85,16 +85,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             KeychainStore.preloadAll()
         }
-
-        // First-launch onboarding. Subsequent launches go straight to Settings
-        // so the user can adjust without re-watching the walkthrough.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            if defaults.bool(forKey: Self.onboardingDoneKey) {
-                Self.openSettings()
-            } else {
-                Self.openOnboarding()
-            }
-        }
     }
 
     /// Dock icon click → open Settings window. Without this handler the dock

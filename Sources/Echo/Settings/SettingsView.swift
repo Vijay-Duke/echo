@@ -197,6 +197,14 @@ private struct ProfileRow: View {
                 .frame(maxWidth: 220)
 
                 Toggle("Inject clipboard", isOn: $profile.injectClipboard)
+
+                if profile.provider == .gemini {
+                    Toggle("Web search", isOn: Binding(
+                        get: { profile.webSearchEnabled ?? false },
+                        set: { profile.webSearchEnabled = $0 }
+                    ))
+                    .help("Google Search grounding (~$35 per 1,000 grounded queries)")
+                }
             }
 
             // Prompt collapsible.

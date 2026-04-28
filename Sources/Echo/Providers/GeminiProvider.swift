@@ -65,29 +65,30 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
 
     private func sendSetup(profile: Profile) async throws {
         let disabled: Bool = (profile.vad != .server)
-        let setup: [String: Any] = [
-            "setup": [
-                "model": profile.modelName,
-                "generationConfig": [
-                    "responseModalities": ["AUDIO"],
-                    "speechConfig": [
-                        "voiceConfig": [
-                            "prebuiltVoiceConfig": ["voiceName": profile.voiceName]
-                        ],
-                        "languageCode": "en-US",
+        var setupBody: [String: Any] = [
+            "model": profile.modelName,
+            "generationConfig": [
+                "responseModalities": ["AUDIO"],
+                "speechConfig": [
+                    "voiceConfig": [
+                        "prebuiltVoiceConfig": ["voiceName": profile.voiceName]
                     ],
+                    "languageCode": "en-US",
                 ],
-                "systemInstruction": [
-                    "parts": [["text": profile.systemPrompt]]
-                ],
-                "realtimeInputConfig": [
-                    "automaticActivityDetection": ["disabled": disabled]
-                ],
-                "outputAudioTranscription": [:] as [String: Any],
-                "inputAudioTranscription": [:] as [String: Any],
-            ]
+            ],
+            "systemInstruction": [
+                "parts": [["text": profile.systemPrompt]]
+            ],
+            "realtimeInputConfig": [
+                "automaticActivityDetection": ["disabled": disabled]
+            ],
+            "outputAudioTranscription": [:] as [String: Any],
+            "inputAudioTranscription": [:] as [String: Any],
         ]
-        try await sendJSON(setup)
+        if profile.webSearchEnabled == true {
+            setupBody["tools"] = [["googleSearch": [:] as [String: Any]]]
+        }
+        try await sendJSON(["setup": setupBody])
     }
 
     // MARK: - Audio in / utterance markers
