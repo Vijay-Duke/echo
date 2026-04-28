@@ -48,6 +48,28 @@ final class AudioEngine: @unchecked Sendable {
                                        channels: 1,
                                        interleaved: false)!
         engine.connect(playerNode, to: engine.mainMixerNode, format: monoFormat)
+
+        // Listen for engine configuration changes (e.g., audio route changes, interruptions).
+        // When interrupted, engine stops and must be restarted explicitly.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleEngineConfigChange),
+            name: NSNotification.Name.AVAudioEngineConfigurationChange,
+            object: engine
+        )
+    }
+
+    @objc private func handleEngineConfigChange() {
+        NSLog("[Audio] engine config changed — restarting")
+        if isPrewarmed && !engine.isRunning {
+            do {
+                try engine.start()
+                playerNode.play()
+                NSLog("[Audio] engine restarted after interruption")
+            } catch {
+                NSLog("[Audio] restart failed: %{public}@", String(describing: error))
+            }
+        }
     }
 
     func setMicMuted(_ muted: Bool) {
@@ -65,12 +87,8 @@ final class AudioEngine: @unchecked Sendable {
         try await Self.ensureMicPermission()
 
         let input = engine.inputNode
-        do {
-            try input.setVoiceProcessingEnabled(true)
-            NSLog("[Audio] voice processing enabled (AEC on)")
-        } catch {
-            NSLog("[Audio] voice processing unavailable: %{public}@", String(describing: error))
-        }
+        // Voice processing will be enabled per-session (startSession) to avoid
+        // ducking system audio when Echo is idle in background.
 
         let inputFormat = input.outputFormat(forBus: tapBus)
         inputSrcRate = inputFormat.sampleRate
@@ -140,6 +158,12 @@ final class AudioEngine: @unchecked Sendable {
         try engine.start()
         NSLog("[Audio] engine started (prewarm)")
 
+        // Explicit volume control. Ensure output is at full level (voice processing
+        // AEC can suppress output for feedback prevention; force to 1.0 for max gain).
+        playerNode.volume = 1.0
+        engine.mainMixerNode.volume = 1.0
+        NSLog("[Audio] volumes: player=%.2f mixer=%.2f", playerNode.volume, engine.mainMixerNode.volume)
+
         // Prime the player so first scheduleBuffer doesn't pay cold-start.
         playerNode.play()
         if let primeFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -160,6 +184,15 @@ final class AudioEngine: @unchecked Sendable {
                       onCapture: @escaping @Sendable (Data) -> Void,
                       onFloatFrame: (@Sendable ([Float]) -> Void)? = nil,
                       onLevel: (@Sendable (Double) -> Void)? = nil) {
+        // Enable voice processing for this session only. Disabling it when idle
+        // prevents system audio ducking while Echo runs in background.
+        do {
+            try engine.inputNode.setVoiceProcessingEnabled(true)
+            NSLog("[Audio] voice processing enabled for session")
+        } catch {
+            NSLog("[Audio] voice processing unavailable: %{public}@", String(describing: error))
+        }
+
         stateLock.lock()
         self.targetRate = targetRate
         self.onCapture = onCapture
@@ -176,6 +209,13 @@ final class AudioEngine: @unchecked Sendable {
 
     /// End-of-session: stop forwarding chunks, drop callbacks. Engine stays alive.
     func stopSession() {
+        do {
+            try engine.inputNode.setVoiceProcessingEnabled(false)
+            NSLog("[Audio] voice processing disabled (idle)")
+        } catch {
+            NSLog("[Audio] disable voice processing failed: %{public}@", String(describing: error))
+        }
+
         stateLock.lock()
         isBroadcasting = false
         onCapture = nil
@@ -230,6 +270,7 @@ final class AudioEngine: @unchecked Sendable {
         playerNode.stop()
         engine.stop()
         engine.detach(playerNode)
+        NotificationCenter.default.removeObserver(self, name: NSNotification.Name.AVAudioEngineConfigurationChange, object: engine)
         isPrewarmed = false
     }
 
