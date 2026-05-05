@@ -50,10 +50,7 @@ struct OnboardingView: View {
             on disk in plaintext, never sent anywhere except the provider's
             realtime endpoint.
 
-            Get one from:
-              • Gemini Live — https://aistudio.google.com/apikey
-              • OpenAI Realtime — https://platform.openai.com/api-keys
-              • xAI Grok Voice — https://console.x.ai
+            Get one from Gemini Live — https://aistudio.google.com/apikey
 
             Open Settings (menu bar icon → Open Settings…) to paste it.
             """

@@ -5,9 +5,10 @@
 secrets.json
 keys.json
 
-# Node (legacy web-demo, removed from git)
+# Node / web-demo (Mac app only — web-demo not shipped)
 node_modules/
 npm-debug.log*
+web-demo/
 
 # Swift / SPM build outputs
 .build/

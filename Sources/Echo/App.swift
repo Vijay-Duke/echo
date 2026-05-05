@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
 import Combine
+import os.log
+
+private let appLog = OSLog(subsystem: "com.echo.session", category: "controller")
+@inline(__always) private func slog(_ msg: String) {
+    os_log("%{public}@", log: appLog, type: .info, msg)
+}
 
 // MARK: - App
 
@@ -21,9 +27,12 @@ struct EchoApp: App {
             .font(.system(size: 12, weight: .medium))
 
         if let p = appDelegate.controller.activeProfile {
-            Text("\(p.name) · \(p.provider.displayName)")
+            Text(p.name)
                 .font(.system(size: 11))
         }
+
+        Text("Hold ⌥+` to talk · release ` to send · release ⌥ to hibernate")
+            .font(.system(size: 11))
 
         Divider()
 
@@ -223,18 +232,12 @@ final class AppController: ObservableObject {
     @Published private(set) var inputLevel: Double = 0
     @Published private(set) var sessionCostUSD: Double = 0
 
-    // Cost rates per provider (USD per minute audio in / out).
+    // Cost rates (USD per minute audio in / out) — Gemini 3.1 flash live.
     private struct RateCard { let inPerMin: Double; let outPerMin: Double }
-    private func rates(for kind: ProviderKind) -> RateCard {
-        switch kind {
-        case .gemini: return RateCard(inPerMin: 0.005,  outPerMin: 0.018)  // 3.1 flash live
-        case .openai: return RateCard(inPerMin: 0.06,   outPerMin: 0.24)   // realtime-mini
-        case .grok:   return RateCard(inPerMin: 0.05,   outPerMin: 0.0)    // flat $0.05/min, output included
-        }
-    }
+    private let rateCard = RateCard(inPerMin: 0.005, outPerMin: 0.018)
 
     // Subsystems.
-    private let hotkeys = HotkeyManager()
+    let chord = ChordMonitor()
     private let hud = HUDPanel()
     private let audio = AudioEngine()
 
@@ -242,11 +245,21 @@ final class AppController: ObservableObject {
     private var currentProvider: VoiceProvider?
     private var currentSessionTask: Task<Void, Never>?
     private var eventPumpTask: Task<Void, Never>?
-    private var currentVAD: VadGate?
-    private var vadDidStartUtterance: Bool = false
-    /// Tracks whether the user is still holding the hotkey. Used to decide
-    /// whether assistant audio finishing should tear down the session.
+
+    // Shadow WSS — pre-connected, keepalive-pinged spare. Promoted on next press
+    // so the user doesn't pay DNS+TLS+WSS+setupComplete (~250-500ms cold start).
+    // Invariant: shadow has zero conversation history (no audio ever sent).
+    private var shadowProvider: GeminiProvider?
+    private var shadowProfileId: UUID?
+    private var shadowKeepAliveTask: Task<Void, Never>?
+    private var shadowConnectTask: Task<Void, Never>?
+    private static let shadowKeepAliveInterval: UInt64 = 30_000_000_000 // 30s
+    /// Tracks whether the user is still holding the primary (session) hotkey.
+    /// Release ends the WSS session entirely.
     private var activeProfileKeyHeld: Bool = false
+    /// Tracks whether the secondary (talk) hotkey is held. While true, mic audio
+    /// streams to the provider. Release sends activityEnd + cuts assistant audio.
+    private var talkKeyHeld: Bool = false
     /// True once we've observed a `.speaking` state for the current session —
     /// guards the auto-end on `.listening` so we don't tear down the very
     /// first `.listening` event that fires right after `setupComplete`.
@@ -278,15 +291,20 @@ final class AppController: ObservableObject {
         let store = ProfilesStore()
         self.profiles = store
 
-        // Re-sync hotkey registrations whenever profiles change.
+        // Shadow refresh is debounced and only fires when setup-relevant fields
+        // change (model/voice/prompt/web-search/first-enabled-profile-id).
         store.$profiles
-            .receive(on: RunLoop.main)
-            .sink { [weak self] list in
-                self?.refreshHotkeys(for: list)
+            .map { Self.shadowFingerprint(for: $0) }
+            .removeDuplicates()
+            .debounce(for: .milliseconds(400), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                self.invalidateShadow()
+                self.warmShadowIfPossible()
             }
             .store(in: &cancellables)
 
-        refreshHotkeys(for: store.profiles)
+        wireChord()
         Self.shared = self
 
         // Prewarm audio at launch — pays the ~150-300ms voice-processing-enable
@@ -295,31 +313,164 @@ final class AppController: ObservableObject {
             do { try await self?.audio.prewarmAll() }
             catch { NSLog("[VG] audio prewarm failed: %{public}@", String(describing: error)) }
         }
+
+        // Warm shadow WSS for the first enabled profile (typically the default
+        // Quick Assistant). Skipped if no API key is configured yet — Settings
+        // can call refreshShadow() after the user pastes a key.
+        warmShadowIfPossible()
+    }
+
+    /// Picks the first enabled profile and opens a parked Gemini Live session
+    /// for it. No-op if a shadow already exists or there's no API key yet.
+    func warmShadowIfPossible() {
+        guard shadowProvider == nil, shadowConnectTask == nil else { return }
+        guard let profile = profiles.profiles.first(where: { $0.enabled }) else { return }
+        guard let apiKey = KeychainStore.apiKey(for: .gemini), !apiKey.isEmpty else {
+            slog("shadow: skipped (no Gemini API key)")
+            return
+        }
+        let p = GeminiProvider()
+        shadowProvider = p
+        shadowProfileId = profile.id
+        let warmStart = Date()
+        slog("shadow: connecting (\(profile.name))")
+        shadowConnectTask = Task { [weak self, weak p] in
+            guard let p = p else { return }
+            do {
+                try await Self.connectWithRetry(provider: p, profile: profile, apiKey: apiKey)
+                let elapsedMs = Int(Date().timeIntervalSince(warmStart) * 1000)
+                await MainActor.run {
+                    guard let self = self, self.shadowProvider === p else { return }
+                    slog("shadow: ready (\(elapsedMs)ms)")
+                    self.shadowConnectTask = nil
+                    self.startShadowKeepAlive(p)
+                }
+            } catch {
+                slog("shadow: connect failed after retries — \(error)")
+                await MainActor.run {
+                    guard let self = self, self.shadowProvider === p else { return }
+                    self.shadowProvider = nil
+                    self.shadowProfileId = nil
+                    self.shadowConnectTask = nil
+                    // Re-warm in 2s — covers transient network drops at launch.
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        self?.warmShadowIfPossible()
+                    }
+                }
+            }
+        }
+    }
+
+    private func startShadowKeepAlive(_ p: GeminiProvider) {
+        shadowKeepAliveTask?.cancel()
+        shadowKeepAliveTask = Task { [weak self, weak p] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: AppController.shadowKeepAliveInterval)
+                if Task.isCancelled { return }
+                guard let p = p else { return }
+                do {
+                    try await p.sendKeepAlive()
+                } catch {
+                    NSLog("[VG] shadow keepalive failed: %{public}@ — refreshing", String(describing: error))
+                    await MainActor.run {
+                        guard let self = self else { return }
+                        if self.shadowProvider === p {
+                            self.shadowProvider = nil
+                            self.shadowProfileId = nil
+                            self.shadowKeepAliveTask = nil
+                            Task.detached { await p.disconnect() }
+                            self.warmShadowIfPossible()
+                        }
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    /// Take ownership of the shadow if it matches the requested profile.
+    /// Returns nil if shadow not ready or for a different profile.
+    private func takeShadow(for profileId: UUID) -> GeminiProvider? {
+        guard let p = shadowProvider,
+              shadowConnectTask == nil,    // connect already finished
+              shadowProfileId == profileId else { return nil }
+        shadowProvider = nil
+        shadowProfileId = nil
+        shadowKeepAliveTask?.cancel()
+        shadowKeepAliveTask = nil
+        return p
+    }
+
+    /// Stable hash of the fields that go into a Gemini Live `setup` payload.
+    /// Used to debounce shadow invalidation so per-keystroke profile edits
+    /// don't churn the WSS.
+    private static func shadowFingerprint(for profiles: [Profile]) -> String {
+        guard let p = profiles.first(where: { $0.enabled }) else { return "" }
+        return [
+            p.id.uuidString,
+            p.modelName,
+            p.voiceName,
+            p.systemPrompt,
+            String(p.webSearchEnabled ?? false),
+        ].joined(separator: "|")
+    }
+
+    /// Drop the current shadow (e.g. profile changed) without taking it.
+    private func invalidateShadow() {
+        guard shadowProvider != nil || shadowConnectTask != nil else { return }
+        NSLog("[VG] invalidating shadow (profile changed)")
+        shadowKeepAliveTask?.cancel(); shadowKeepAliveTask = nil
+        shadowConnectTask?.cancel(); shadowConnectTask = nil
+        let dying = shadowProvider
+        shadowProvider = nil
+        shadowProfileId = nil
+        Task.detached { await dying?.disconnect() }
     }
 
     var menuStatus: String { "Status: \(state.menuLabel)" }
 
     // MARK: - Hotkey wiring
 
-    private func refreshHotkeys(for list: [Profile]) {
-        hotkeys.unregisterAll()
-        for profile in list where profile.enabled {
-            hotkeys.register(
-                profile: profile,
-                onActivate: { [weak self] in
-                    Task { @MainActor in self?.activate(profile: profile) }
-                },
-                onDeactivate: { [weak self] in
-                    Task { @MainActor in self?.deactivate(profile: profile) }
-                }
-            )
+    private func wireChord() {
+        // ⌥ alone does nothing — shadow is already pre-warmed at app launch
+        // and after each release, so the chord still gets a warm WSS.
+        chord.onModifierDown = { /* no-op */ }
+        // Full chord (⌥ + `) down: activate session (uses warm shadow) + start
+        // streaming mic.
+        chord.onTriggerDown = { [weak self] in
+            Task { @MainActor in
+                guard let self = self,
+                      let p = self.activeProfile ?? self.profiles.profiles.first(where: { $0.enabled })
+                else { return }
+                if self.activeProfile == nil { self.activate(profile: p) }
+                self.beginTalk(profile: p)
+            }
         }
+        // ` released (⌥ still held): send activityEnd → AI responds. Session
+        // stays alive so user can press ` again for a follow-up turn (history
+        // retained on the same WSS).
+        chord.onTriggerUp = { [weak self] in
+            Task { @MainActor in
+                guard let self = self, let p = self.activeProfile else { return }
+                self.endTalk(profile: p)
+            }
+        }
+        // ⌥ released: hibernate. Kill audio, tear down WSS, wipe history,
+        // re-warm a fresh shadow for the next chord.
+        chord.onModifierUp = { [weak self] in
+            Task { @MainActor in
+                guard let self = self, let p = self.activeProfile else { return }
+                self.deactivate(profile: p)
+            }
+        }
+        chord.start()
     }
 
     // MARK: - Session lifecycle
 
     private func activate(profile: Profile) {
-        NSLog("[VG] activate profile=%{public}@ vad=%{public}@ provider=%{public}@", profile.name, profile.vad.rawValue, profile.provider.rawValue)
+        NSLog("[VG] activate profile=%{public}@", profile.name)
         if isTearingDown { NSLog("[VG] activate ignored — teardown in progress"); return }
         activeProfileKeyHeld = true
 
@@ -338,23 +489,20 @@ final class AppController: ObservableObject {
         activeProfile = profile
         setState(.connecting)
 
-        guard let apiKey = KeychainStore.apiKey(for: profile.provider), !apiKey.isEmpty else {
-            NSLog("[VG] no API key for %{public}@", profile.provider.rawValue)
-            setState(.error("No API key for \(profile.provider.displayName). Open Settings."))
+        guard let apiKey = KeychainStore.apiKey(for: .gemini), !apiKey.isEmpty else {
+            NSLog("[VG] no API key for gemini")
+            setState(.error("No Gemini API key. Open Settings."))
             return
         }
         NSLog("[VG] api key present, len=%d", apiKey.count)
 
-        let provider: VoiceProvider
-        switch profile.provider {
-        case .gemini: provider = GeminiProvider()
-        case .openai: provider = OpenAIProvider()
-        case .grok:   provider = GrokProvider()
-        }
+        let warmShadow = takeShadow(for: profile.id)
+        let provider: VoiceProvider = warmShadow ?? GeminiProvider()
+        let usingShadow = warmShadow != nil
+        slog(usingShadow ? "press: WARM shadow used (skip handshake)" : "press: COLD connect (no shadow ready)")
         currentProvider = provider
 
-        // Provider sample rate convention.
-        let micRate: Double = (profile.provider == .gemini) ? 16000 : 24000
+        let micRate: Double = 16000
 
         // Pump provider events to UI + audio playback.
         eventPumpTask?.cancel()
@@ -421,7 +569,7 @@ final class AppController: ObservableObject {
                     NSLog("[VG] provider error: %{public}@", msg)
                     await MainActor.run { self.setState(.error(msg)) }
                 case .costUpdate(let inSec, let outSec):
-                    let r = self.rates(for: profile.provider)
+                    let r = self.rateCard
                     let cost = (inSec / 60.0) * r.inPerMin + (outSec / 60.0) * r.outPerMin
                     await MainActor.run {
                         self.sessionCostUSD = cost
@@ -434,58 +582,24 @@ final class AppController: ObservableObject {
             }
         }
 
-        // Build Silero VAD gate when requested. If construction fails (e.g. ONNX
-        // model missing), we silently fall back to ungated capture for this
-        // session — the alternative would be a hard failure on hotkey activate.
-        let vadGate: VadGate?
-        if profile.vad == .silero {
-            let g = VadGate()
-            if g == nil {
-                NSLog("[AppController] Silero VAD unavailable; proceeding ungated")
-            }
-            vadGate = g
-        } else {
-            vadGate = nil
-        }
-        self.currentVAD = vadGate
-        self.vadDidStartUtterance = false
-
-        // Wire VAD events → provider utterance lifecycle.
-        if let gate = vadGate {
-            gate.onEvent = { [weak self, weak provider] event in
-                guard let self = self, let provider = provider else { return }
-                switch event {
-                case .speechStart:
-                    Task { @MainActor in self.vadDidStartUtterance = true }
-                    Task { try? await provider.startUtterance() }
-                case .speechEnd:
-                    Task { @MainActor in self.vadDidStartUtterance = false }
-                    Task { try? await provider.endUtterance() }
-                }
-            }
-        }
-
-        // Start mic capture immediately (engine is prewarmed at app launch — this
-        // is sub-ms now) AND kick off WSS connect in parallel. Pre-connect audio
-        // is dropped: server VAD discards leading silence anyway, but the bytes
-        // would still bill. Worth ~150ms of perceived "first phoneme" delay to
-        // not pay for ambient room noise on every press.
+        // PTT + server-VAD only — no client VAD gate, no manual utterance markers.
+        // Server VAD detects end-of-speech within the hold so multi-turn works
+        // while the key is held; release tears the session down entirely.
         let providerReady = ReadyFlag()
         let mySessionGen = myGen
         audio.startSession(
             targetRate: micRate,
-            onCapture: { [weak provider, weak vadGate, weak self] pcm in
-                if let g = vadGate, !g.isSpeaking { return }
+            onCapture: { [weak provider, weak self] pcm in
                 guard providerReady.value, let provider = provider else { return }
-                // Stale-session guard: reject chunks queued before teardown.
                 Task { @MainActor in
-                    guard let self = self, self.sessionGen == mySessionGen else { return }
+                    guard let self = self,
+                          self.sessionGen == mySessionGen,
+                          self.talkKeyHeld
+                    else { return }
                     try? await provider.sendAudio(pcm)
                 }
             },
-            onFloatFrame: vadGate.map { gate in
-                { @Sendable (frame: [Float]) in gate.feed(frame, rate: micRate) }
-            },
+            onFloatFrame: nil,
             onLevel: { [weak self] lvl in
                 Task { @MainActor in
                     guard let self = self, self.sessionGen == myGen else { return }
@@ -500,8 +614,13 @@ final class AppController: ObservableObject {
         currentSessionTask = Task { [weak self] in
             guard let self = self else { return }
             do {
-                NSLog("[VG] connecting provider...")
-                try await provider.connect(profile: profile, apiKey: apiKey)
+                if usingShadow {
+                    NSLog("[VG] shadow already connected — skipping handshake")
+                } else {
+                    try await Self.connectWithRetry(provider: provider,
+                                                    profile: profile,
+                                                    apiKey: apiKey)
+                }
 
                 let stillCurrent = await MainActor.run { self.sessionGen == myGen }
                 if !stillCurrent {
@@ -512,10 +631,6 @@ final class AppController: ObservableObject {
                 }
 
                 providerReady.value = true
-
-                if profile.vad != .server && profile.vad != .silero {
-                    try await provider.startUtterance()
-                }
             } catch {
                 let stillCurrent = await MainActor.run { self.sessionGen == myGen }
                 if stillCurrent {
@@ -526,23 +641,97 @@ final class AppController: ObservableObject {
         }
     }
 
+    /// Connect with up to 2 retries and short backoff on transient errors.
+    /// Network blips, TLS handshake hiccups, and Gemini Live preview
+    /// throttling all manifest as throwing once and succeeding on retry.
+    private static func connectWithRetry(provider: VoiceProvider,
+                                         profile: Profile,
+                                         apiKey: String) async throws {
+        var attempts = 0
+        let maxAttempts = 3
+        let backoffsMs: [UInt64] = [0, 200, 600]
+        while true {
+            attempts += 1
+            do {
+                if attempts > 1 {
+                    try await Task.sleep(nanoseconds: backoffsMs[attempts - 1] * 1_000_000)
+                    NSLog("[VG] connect retry attempt %d", attempts)
+                } else {
+                    NSLog("[VG] connecting provider…")
+                }
+                try await provider.connect(profile: profile, apiKey: apiKey)
+                if attempts > 1 { NSLog("[VG] connect succeeded on retry %d", attempts) }
+                return
+            } catch {
+                if attempts >= maxAttempts {
+                    NSLog("[VG] connect failed after %d attempts: %{public}@",
+                          attempts, String(describing: error))
+                    throw error
+                }
+                NSLog("[VG] connect attempt %d failed: %{public}@ — retrying",
+                      attempts, String(describing: error))
+            }
+        }
+    }
+
 
     /// On hotkey release: kill the session entirely. Fresh-per-press model —
     /// no conversation memory carried over, no lingering open socket.
     private func deactivate(profile: Profile) {
-        NSLog("[VG] deactivate profile=%{public}@", profile.name)
+        slog("press: hibernate (modifier up)")
         activeProfileKeyHeld = false
+        talkKeyHeld = false
         guard let active = activeProfile, active.id == profile.id else { return }
         let provider = currentProvider
 
-        currentVAD?.onEvent = nil
-        currentVAD = nil
-        vadDidStartUtterance = false
-
-        audio.stopSession()
+        // SNAPPY: tear the UI down synchronously so the HUD vanishes the
+        // moment the user releases the modifier. Slow async cleanup (WS close,
+        // shadow rewarm) runs detached and never blocks visible state.
         audio.cutPlayback()
-        Task { try? await provider?.interrupt() }
-        endSession()
+        audio.stopSession()
+        sessionGen &+= 1
+        currentSessionTask?.cancel(); currentSessionTask = nil
+        eventPumpTask?.cancel(); eventPumpTask = nil
+        currentProvider = nil
+        currentTranscript = ""
+        sessionHasResponded = false
+        isTearingDown = false
+        setState(.idle)
+        activeProfile = nil
+        hud.hide()        // skip the 1.2s auto-hide; release should feel instant
+
+        Task.detached { [weak self] in
+            try? await provider?.interrupt()
+            await provider?.disconnect()
+            await MainActor.run { self?.warmShadowIfPossible() }
+        }
+    }
+
+    /// Talk key down: enable mic streaming + send activityStart.
+    /// Cuts any in-flight assistant audio (barge-in).
+    private func beginTalk(profile: Profile) {
+        slog("press: talk-down")
+        // Auto-start session if user pressed talk without session key first.
+        if activeProfile == nil {
+            activate(profile: profile)
+        }
+        guard let active = activeProfile, active.id == profile.id else { return }
+        if talkKeyHeld { return }
+        talkKeyHeld = true
+        // Barge-in: cut any in-flight assistant playback.
+        audio.cutPlayback()
+        let provider = currentProvider
+        Task { try? await provider?.startUtterance() }
+    }
+
+    /// Talk key up: send activityEnd → server generates response.
+    private func endTalk(profile: Profile) {
+        slog("press: talk-up")
+        guard talkKeyHeld else { return }
+        talkKeyHeld = false
+        guard let active = activeProfile, active.id == profile.id else { return }
+        let provider = currentProvider
+        Task { try? await provider?.endUtterance() }
     }
 
     /// Full teardown: drops the socket and clears active profile. Called on
@@ -559,11 +748,14 @@ final class AppController: ObservableObject {
         Task { [weak self] in
             await provider?.disconnect()
             await MainActor.run {
-                self?.eventPumpTask?.cancel()
-                self?.eventPumpTask = nil
-                self?.setState(.idle)
-                self?.activeProfile = nil
-                self?.isTearingDown = false
+                guard let self = self else { return }
+                self.eventPumpTask?.cancel()
+                self.eventPumpTask = nil
+                self.setState(.idle)
+                self.activeProfile = nil
+                self.isTearingDown = false
+                // Spin up a fresh shadow for the next press.
+                self.warmShadowIfPossible()
             }
         }
     }
@@ -580,11 +772,11 @@ final class AppController: ObservableObject {
         eventPumpTask?.cancel()
         eventPumpTask = nil
         currentProvider = nil
-        currentVAD?.onEvent = nil
-        currentVAD = nil
-        vadDidStartUtterance = false
         audio.stopSession()
         Task.detached { await provider?.disconnect() }
+        // Don't spawn a new shadow here — activate() is mid-flight and will
+        // construct its own provider (cold) since the old shadow was already
+        // either taken or is invalid. The next endSession() will re-warm.
     }
 
     private func setState(_ newState: ProviderState) {

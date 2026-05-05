@@ -19,8 +19,6 @@ struct SettingsView: View {
 
 private struct GeneralSettingsView: View {
     @State private var geminiKey: String = ""
-    @State private var openaiKey: String = ""
-    @State private var grokKey: String = ""
     @State private var outputDevice: String = "System Default"
     @State private var showDockIcon: Bool = UserDefaults.standard.bool(forKey: AppDelegate.showDockIconKey)
 
@@ -35,9 +33,7 @@ private struct GeneralSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("API Keys") {
-                apiRow(label: "Gemini",  text: $geminiKey, provider: .gemini)
-                apiRow(label: "OpenAI",  text: $openaiKey, provider: .openai)
-                apiRow(label: "Grok",    text: $grokKey,   provider: .grok)
+                apiRow(label: "Gemini", text: $geminiKey, provider: .gemini)
             }
             Section("Audio") {
                 Picker("Output device", selection: $outputDevice) {
@@ -53,8 +49,6 @@ private struct GeneralSettingsView: View {
         .padding(20)
         .onAppear {
             geminiKey = KeychainStore.apiKey(for: .gemini) ?? ""
-            openaiKey = KeychainStore.apiKey(for: .openai) ?? ""
-            grokKey   = KeychainStore.apiKey(for: .grok)   ?? ""
         }
     }
 
@@ -66,6 +60,7 @@ private struct GeneralSettingsView: View {
                 .textFieldStyle(.roundedBorder)
             Button("Save") {
                 KeychainStore.setAPIKey(text.wrappedValue, for: provider)
+                AppController.shared?.warmShadowIfPossible()
             }
             .disabled(text.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
         }
@@ -144,9 +139,7 @@ private struct ProfileRow: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 200)
 
-                KeyboardShortcuts.Recorder(
-                    for: KeyboardShortcuts.Name(profileHotkeyName: profile.hotkeyName)
-                )
+                ChordBindingView()
 
                 Spacer()
 
@@ -154,23 +147,6 @@ private struct ProfileRow: View {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.borderless)
-            }
-
-            // Pickers row.
-            HStack(spacing: 12) {
-                Picker("Mode", selection: $profile.mode) {
-                    ForEach(ActivationMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
-                    }
-                }
-                .frame(maxWidth: 240)
-
-                Picker("Provider", selection: $profile.provider) {
-                    ForEach(ProviderKind.allCases) { p in
-                        Text(p.displayName).tag(p)
-                    }
-                }
-                .frame(maxWidth: 200)
             }
 
             HStack(spacing: 12) {
@@ -182,13 +158,6 @@ private struct ProfileRow: View {
             }
 
             HStack(spacing: 12) {
-                Picker("VAD", selection: $profile.vad) {
-                    ForEach(VADKind.allCases) { v in
-                        Text(v.displayName).tag(v)
-                    }
-                }
-                .frame(maxWidth: 220)
-
                 Picker("Output", selection: $profile.output) {
                     ForEach(OutputTarget.allCases) { o in
                         Text(o.displayName).tag(o)
@@ -198,13 +167,11 @@ private struct ProfileRow: View {
 
                 Toggle("Inject clipboard", isOn: $profile.injectClipboard)
 
-                if profile.provider == .gemini {
-                    Toggle("Web search", isOn: Binding(
-                        get: { profile.webSearchEnabled ?? false },
-                        set: { profile.webSearchEnabled = $0 }
-                    ))
-                    .help("Google Search grounding (~$35 per 1,000 grounded queries)")
-                }
+                Toggle("Web search", isOn: Binding(
+                    get: { profile.webSearchEnabled ?? false },
+                    set: { profile.webSearchEnabled = $0 }
+                ))
+                .help("Google Search grounding (~$35 per 1,000 grounded queries)")
             }
 
             // Prompt collapsible.
@@ -232,6 +199,65 @@ private struct ProfileRow: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
         )
+    }
+}
+
+// MARK: - Chord binding
+
+private struct ChordBindingView: View {
+    @State private var label: String = ChordBindingView.formatBinding()
+    @State private var capturing: Bool = false
+
+    static func formatBinding() -> String {
+        let mods = UserDefaults.standard.integer(forKey: "chord.modifier.v1")
+        let kc = UserDefaults.standard.integer(forKey: "chord.keyCode.v1")
+        let modMask: UInt64 = mods == 0 ? CGEventFlags.maskAlternate.rawValue : UInt64(mods)
+        let keyCode = kc == 0 ? 50 : kc
+        var parts: [String] = []
+        if modMask & CGEventFlags.maskControl.rawValue   != 0 { parts.append("⌃") }
+        if modMask & CGEventFlags.maskAlternate.rawValue != 0 { parts.append("⌥") }
+        if modMask & CGEventFlags.maskShift.rawValue     != 0 { parts.append("⇧") }
+        if modMask & CGEventFlags.maskCommand.rawValue   != 0 { parts.append("⌘") }
+        parts.append(keyCodeToString(keyCode))
+        return parts.joined()
+    }
+
+    static func keyCodeToString(_ kc: Int) -> String {
+        switch kc {
+        case 50: return "`"
+        case 49: return "Space"
+        case 36: return "Return"
+        case 53: return "Esc"
+        case 48: return "Tab"
+        default: return "Key#\(kc)"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Hotkey").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Text(capturing ? "Press chord…" : label)
+                    .font(.system(size: 13, design: .monospaced))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.controlBackgroundColor)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(capturing ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: 1))
+                Button(capturing ? "Cancel" : "Record") {
+                    if capturing {
+                        AppController.shared?.chord.onCapture = nil
+                        capturing = false
+                    } else {
+                        capturing = true
+                        AppController.shared?.chord.onCapture = { _, _ in
+                            label = ChordBindingView.formatBinding()
+                            capturing = false
+                        }
+                    }
+                }
+            }
+            Text("hold full chord to talk · release trigger to send · release modifier to hibernate")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
     }
 }
 

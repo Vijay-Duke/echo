@@ -1,4 +1,10 @@
 import Foundation
+import os.log
+
+private let plog = OSLog(subsystem: "com.echo.session", category: "gemini")
+@inline(__always) private func slog(_ msg: String) {
+    os_log("%{public}@", log: plog, type: .info, msg)
+}
 
 /// VoiceProvider for Gemini Live API.
 ///
@@ -19,6 +25,10 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
     private var profile: Profile?
     private var inputSeconds: Double = 0
     private var outputSeconds: Double = 0
+    /// Set when first audio frame is sent to server (= user speaks). Cleared on
+    /// turn complete. Used to log end-of-user-speech -> first-audio-out delta.
+    private var lastAudioSentAt: Date?
+    private var firstAudioOutLoggedThisTurn: Bool = false
     /// Set by `disconnect()`. Suppresses the .error event the receiveLoop
     /// would otherwise emit when the URLSession task is intentionally cancelled.
     private var isDisconnecting: Bool = false
@@ -46,25 +56,30 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
             throw NSError(domain: "GeminiProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "bad url"])
         }
 
+        let t0 = Date()
         let task = session.webSocketTask(with: url)
         self.task = task
         task.resume()
+        slog("connect: WSS resume()")
 
         // Start receive loop before sending setup so we catch setupComplete.
         receiveTask = Task { [weak self] in await self?.receiveLoop() }
 
         try await sendSetup(profile: profile)
+        slog("connect: setup sent (+\(Int(Date().timeIntervalSince(t0)*1000))ms)")
 
         // Wait for setupComplete.
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             self.setupContinuation = cont
         }
+        slog("connect: setupComplete (+\(Int(Date().timeIntervalSince(t0)*1000))ms)")
 
         yielder.yield(.stateChange(.listening))
     }
 
     private func sendSetup(profile: Profile) async throws {
-        let disabled: Bool = (profile.vad != .server)
+        // PTT-only app: server VAD stays enabled so multi-turn works while the
+        // hotkey is held. Release tears the WSS down entirely.
         var setupBody: [String: Any] = [
             "model": profile.modelName,
             "generationConfig": [
@@ -75,12 +90,16 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
                     ],
                     "languageCode": "en-US",
                 ],
+                "thinkingConfig": ["thinkingBudget": 0],
             ],
             "systemInstruction": [
                 "parts": [["text": profile.systemPrompt]]
             ],
             "realtimeInputConfig": [
-                "automaticActivityDetection": ["disabled": disabled]
+                // 2-key PTT: client signals utterance boundaries explicitly via
+                // activityStart/activityEnd. Server VAD off = zero silence wait.
+                "automaticActivityDetection": ["disabled": true],
+                "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
             ],
             "outputAudioTranscription": [:] as [String: Any],
             "inputAudioTranscription": [:] as [String: Any],
@@ -96,6 +115,7 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
     func sendAudio(_ pcm16: Data) async throws {
         let b64 = pcm16.base64EncodedString()
         inputSeconds += Double(pcm16.count) / 2.0 / 16000.0
+        lastAudioSentAt = Date()
         let msg: [String: Any] = [
             "realtimeInput": [
                 "audio": [
@@ -108,12 +128,12 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
     }
 
     func startUtterance() async throws {
-        guard let p = profile, p.vad != .server else { return }
+        slog("activityStart")
         try await sendJSON(["realtimeInput": ["activityStart": [:] as [String: Any]]])
     }
 
     func endUtterance() async throws {
-        guard let p = profile, p.vad != .server else { return }
+        slog("activityEnd")
         try await sendJSON(["realtimeInput": ["activityEnd": [:] as [String: Any]]])
     }
 
@@ -135,6 +155,21 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
         }
         yielder.yield(.stateChange(.idle))
         yielder.finish()
+    }
+
+    /// Send a WebSocket-level ping. Used to keep a parked (shadow) socket alive
+    /// across the documented ~10 minute Gemini Live session lifetime. Returns
+    /// when the pong is received; throws on transport failure.
+    func sendKeepAlive() async throws {
+        guard let task = task else {
+            throw NSError(domain: "GeminiProvider", code: -3, userInfo: [NSLocalizedDescriptionKey: "no socket"])
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            task.sendPing { error in
+                if let error = error { cont.resume(throwing: error) }
+                else { cont.resume() }
+            }
+        }
     }
 
     // MARK: - WS plumbing
@@ -247,14 +282,19 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
 
         if let modelTurn = sc["modelTurn"] as? [String: Any],
            let parts = modelTurn["parts"] as? [[String: Any]] {
-            NSLog("[Gemini] modelTurn parts=%d", parts.count)
-            for (i, part) in parts.enumerated() {
-                NSLog("[Gemini] part[%d] keys=%{public}@", i, part.keys.joined(separator: ","))
+            for part in parts {
                 guard let inline = part["inlineData"] as? [String: Any] else { continue }
-                NSLog("[Gemini] inlineData keys=%{public}@ mime=%{public}@", inline.keys.joined(separator: ","), (inline["mimeType"] as? String) ?? "?")
                 guard let b64 = inline["data"] as? String else { continue }
-                NSLog("[Gemini] inline data b64.count=%d", b64.count)
                 guard let bytes = Data(base64Encoded: b64) else { continue }
+                if !firstAudioOutLoggedThisTurn {
+                    firstAudioOutLoggedThisTurn = true
+                    if let t = lastAudioSentAt {
+                        let ms = Int(Date().timeIntervalSince(t) * 1000)
+                        slog("turn: end-of-user-speech -> first-audio-out: \(ms)ms")
+                    } else {
+                        slog("turn: first-audio-out (no audio-sent timestamp)")
+                    }
+                }
                 // Skip tiny (sub-millisecond) chunks — AVAudio scheduling them on the
                 // playback queue can crash the consumer Task silently.
                 if bytes.count < 64 { continue }
@@ -268,6 +308,9 @@ final class GeminiProvider: NSObject, VoiceProvider, @unchecked Sendable {
         }
 
         if let done = sc["turnComplete"] as? Bool, done {
+            slog("turn: complete")
+            firstAudioOutLoggedThisTurn = false
+            lastAudioSentAt = nil
             yielder.yield(.assistantTextDone)
             yielder.yield(.stateChange(.listening))
         }
