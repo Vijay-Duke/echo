@@ -13,14 +13,14 @@ struct OnboardingView: View {
     private let pages: [OnboardingPage] = [
         OnboardingPage(
             symbol: "waveform.and.mic",
-            title: "Hold the hotkey, talk, release.",
+            title: "Hold the chord, talk, release.",
             body: """
-            Echo is a push-to-talk voice agent that streams your microphone to a
-            realtime model (Gemini Live, OpenAI Realtime, or Grok) and plays the
-            spoken reply back.
+            Echo is a push-to-talk voice agent. It streams your microphone to
+            Gemini Live and plays the spoken reply back.
 
-            Default hotkey is the backtick key (\u{0060}). You can change it
-            per-profile in Settings.
+            The default chord is ⌥ + \u{0060} (Option + backtick): hold both to
+            talk, release the backtick to send, release Option to end the
+            session. It is one app-wide chord — change it in Settings → General.
 
             A small pill behind your MacBook notch shows live state — listening,
             thinking, speaking — and the running cost of the session.
@@ -33,13 +33,14 @@ struct OnboardingView: View {
             • Microphone — to capture what you say. macOS will prompt the first
               time you use Echo. Required.
 
-            • Accessibility — only if a profile uses the “Paste at cursor”
-              output mode. Echo posts a synthetic ⌘V into the focused app so
-              the spoken reply lands as text. Without it, the reply still goes
-              to your clipboard and you can paste it manually. Optional.
+            • Accessibility — required. Echo uses it to capture the global
+              chord from any app, and to paste replies at the cursor for the
+              “Paste” output modes. macOS prompts on first launch; if you miss
+              it, grant access in System Settings → Privacy & Security →
+              Accessibility, then the hotkey starts working immediately.
 
             No data leaves your Mac except the audio frames you send, on the
-            socket you opened, to the provider whose API key you pasted.
+            socket you opened, to Gemini.
             """
         ),
         OnboardingPage(

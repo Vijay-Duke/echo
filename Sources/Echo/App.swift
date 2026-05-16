@@ -31,7 +31,7 @@ struct EchoApp: App {
                 .font(.system(size: 11))
         }
 
-        Text("Hold ⌥+` to talk · release ` to send · release ⌥ to hibernate")
+        Text(appDelegate.controller.chordHintText)
             .font(.system(size: 11))
 
         Divider()
@@ -260,6 +260,15 @@ final class AppController: ObservableObject {
     /// Tracks whether the secondary (talk) hotkey is held. While true, mic audio
     /// streams to the provider. Release sends activityEnd + cuts assistant audio.
     private var talkKeyHeld: Bool = false
+    /// Thread-safe mirror of `talkKeyHeld`, read from the serial audio capture
+    /// queue so the capture callback can gate frames without hopping to the
+    /// main actor (which would reorder them).
+    private let talkGate = ReadyFlag()
+
+    /// Hotkey instructions for the menu bar, derived from the live chord binding.
+    var chordHintText: String {
+        "Hold \(chord.displayString) to talk · release \(chord.triggerString) to send · release \(chord.modifierString) to hibernate"
+    }
     /// True once we've observed a `.speaking` state for the current session —
     /// guards the auto-end on `.listening` so we don't tear down the very
     /// first `.listening` event that fires right after `setupComplete`.
@@ -465,6 +474,20 @@ final class AppController: ObservableObject {
             }
         }
         chord.start()
+        // The CGEventTap needs Accessibility permission, which may not be
+        // granted at first launch — `start()` then fails silently. Re-arm each
+        // time the app becomes active (e.g. returning from System Settings
+        // after granting permission) so the chord and the Settings recorder
+        // begin working without requiring an app relaunch.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self, !self.chord.isRunning else { return }
+                if self.chord.start() { NSLog("[VG] chord tap armed on activation") }
+            }
+        }
     }
 
     // MARK: - Session lifecycle
@@ -541,7 +564,11 @@ final class AppController: ObservableObject {
                     }
                 case .audioOut(let pcm, let rate):
                     NSLog("[VG] audioOut bytes=%d rate=%d", pcm.count, rate)
-                    self.audio.playPCM16(pcm, rate: rate)
+                    // Only route to the speakers for output modes that speak.
+                    // `.paste`/`.none` are text-only — playing would leak audio.
+                    if profile.output.playsAudio {
+                        self.audio.playPCM16(pcm, rate: rate)
+                    }
                 case .userText(let t):
                     NSLog("[VG] user: %{public}@", t)
                 case .assistantTextDelta(let t):
@@ -552,17 +579,12 @@ final class AppController: ObservableObject {
                     await MainActor.run {
                         let text = self.currentTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !text.isEmpty else { return }
-                        switch profile.output {
-                        case .paste, .both:
+                        if profile.output.pastesText {
                             let pb = NSPasteboard.general
                             pb.clearContents()
                             pb.setString(text, forType: .string)
                             NSLog("[VG] copied %d chars to clipboard", text.count)
-                            if profile.output == .paste || profile.output == .both {
-                                Self.simulatePasteIfPossible()
-                            }
-                        case .speak, .none:
-                            break
+                            Self.simulatePasteIfPossible()
                         }
                     }
                 case .error(let msg):
@@ -586,18 +608,17 @@ final class AppController: ObservableObject {
         // Server VAD detects end-of-speech within the hold so multi-turn works
         // while the key is held; release tears the session down entirely.
         let providerReady = ReadyFlag()
-        let mySessionGen = myGen
+        let talkGate = self.talkGate
         audio.startSession(
             targetRate: micRate,
-            onCapture: { [weak provider, weak self] pcm in
-                guard providerReady.value, let provider = provider else { return }
-                Task { @MainActor in
-                    guard let self = self,
-                          self.sessionGen == mySessionGen,
-                          self.talkKeyHeld
-                    else { return }
-                    try? await provider.sendAudio(pcm)
-                }
+            onCapture: { [weak provider] pcm in
+                // Synchronous + FIFO: the capture queue is serial and
+                // `sendAudio` enqueues without suspension, so frames reach
+                // Gemini in capture order. `talkGate` is the thread-safe
+                // mirror of `talkKeyHeld`.
+                guard providerReady.value, talkGate.value,
+                      let provider = provider else { return }
+                provider.sendAudio(pcm)
             },
             onFloatFrame: nil,
             onLevel: { [weak self] lvl in
@@ -681,6 +702,7 @@ final class AppController: ObservableObject {
         slog("press: hibernate (modifier up)")
         activeProfileKeyHeld = false
         talkKeyHeld = false
+        talkGate.value = false
         guard let active = activeProfile, active.id == profile.id else { return }
         let provider = currentProvider
 
@@ -700,10 +722,12 @@ final class AppController: ObservableObject {
         activeProfile = nil
         hud.hide()        // skip the 1.2s auto-hide; release should feel instant
 
-        Task.detached { [weak self] in
-            try? await provider?.interrupt()
+        provider?.interrupt()
+        // Runs on the main actor but suspends at the `await` — visible state is
+        // already torn down above, so this slow cleanup never blocks the UI.
+        Task { [weak self] in
             await provider?.disconnect()
-            await MainActor.run { self?.warmShadowIfPossible() }
+            self?.warmShadowIfPossible()
         }
     }
 
@@ -718,10 +742,10 @@ final class AppController: ObservableObject {
         guard let active = activeProfile, active.id == profile.id else { return }
         if talkKeyHeld { return }
         talkKeyHeld = true
+        talkGate.value = true
         // Barge-in: cut any in-flight assistant playback.
         audio.cutPlayback()
-        let provider = currentProvider
-        Task { try? await provider?.startUtterance() }
+        currentProvider?.startUtterance()
     }
 
     /// Talk key up: send activityEnd → server generates response.
@@ -729,9 +753,9 @@ final class AppController: ObservableObject {
         slog("press: talk-up")
         guard talkKeyHeld else { return }
         talkKeyHeld = false
+        talkGate.value = false
         guard let active = activeProfile, active.id == profile.id else { return }
-        let provider = currentProvider
-        Task { try? await provider?.endUtterance() }
+        currentProvider?.endUtterance()
     }
 
     /// Full teardown: drops the socket and clears active profile. Called on
@@ -740,6 +764,8 @@ final class AppController: ObservableObject {
         NSLog("[VG] endSession")
         if isTearingDown { return }
         isTearingDown = true
+        talkKeyHeld = false
+        talkGate.value = false
         let provider = currentProvider
         sessionGen &+= 1 // invalidate any in-flight closures
         currentSessionTask?.cancel()
@@ -766,6 +792,7 @@ final class AppController: ObservableObject {
     /// no-ops as soon as their `sessionGen == myGen` check fails.
     private func forceEndSessionSync() {
         let provider = currentProvider
+        talkGate.value = false
         sessionGen &+= 1
         currentSessionTask?.cancel()
         currentSessionTask = nil
@@ -829,8 +856,7 @@ final class AppController: ObservableObject {
         if heldMs >= Self.BARGE_HOLD_MS {
             NSLog("[VG] barge-in: level=%.3f held=%.0fms — cutting assistant", level, heldMs)
             audio.cutPlayback()
-            let provider = currentProvider
-            Task { try? await provider?.interrupt() }
+            currentProvider?.interrupt()
             // Reset timer so we don't fire again until level drops.
             bargeInLastUnderTime = Date.distantFuture
         }

@@ -8,9 +8,12 @@ import CoreGraphics
 ///   - Modifier up → onModifierUp (kill audio + teardown)
 ///
 /// Uses a `CGEventTap` on the HID stream so the chord fires from any focused
-/// app. Requires Accessibility permission (already granted for ⌘V paste).
-/// Trigger keyDown/keyUp events are SWALLOWED while the modifier is held so
-/// the focused app doesn't receive a stray backtick.
+/// app. Requires Accessibility permission. Trigger keyDown/keyUp events are
+/// SWALLOWED while the modifier is held so the focused app doesn't receive a
+/// stray backtick.
+///
+/// The chord is a single app-wide binding (stored in `UserDefaults`). It is not
+/// per-profile — one press activates whichever profile is first-enabled.
 final class ChordMonitor {
     var onModifierDown: () -> Void = {}
     var onModifierUp: () -> Void = {}
@@ -27,33 +30,106 @@ final class ChordMonitor {
     /// rebind the chord from Settings.
     var onCapture: ((CGEventFlags, Int64) -> Void)?
 
+    /// True once the `CGEventTap` is live and receiving events. False when
+    /// Accessibility permission is missing — `start()` is safe to retry once
+    /// the user grants it (see `AppController` re-arming on app activation).
+    private(set) var isRunning = false
+
     private static let kKeyCodeDefault = "chord.keyCode.v1"
     private static let kModifierDefault = "chord.modifier.v1"
+    private static let defaultKeyCode: Int64 = 50              // kVK_ANSI_Grave (`)
+    private static let defaultModifier: CGEventFlags = .maskAlternate
+
     private static func loadKeyCode() -> Int64 {
-        let v = UserDefaults.standard.integer(forKey: kKeyCodeDefault)
-        return v == 0 ? 50 : Int64(v)
+        // `object(forKey:)` nil-check — keycode 0 is a *valid* key (kVK_ANSI_A),
+        // so a stored 0 must not be mistaken for "unset".
+        guard let v = UserDefaults.standard.object(forKey: kKeyCodeDefault) as? Int else {
+            return defaultKeyCode
+        }
+        return Int64(v)
     }
     private static func loadModifier() -> CGEventFlags {
-        let raw = UserDefaults.standard.integer(forKey: kModifierDefault)
-        return raw == 0 ? .maskAlternate : CGEventFlags(rawValue: UInt64(raw))
+        guard let raw = UserDefaults.standard.object(forKey: kModifierDefault) as? Int,
+              raw != 0 else {
+            return defaultModifier
+        }
+        return CGEventFlags(rawValue: UInt64(raw))
     }
     func saveBinding() {
         UserDefaults.standard.set(Int(triggerKeyCode), forKey: Self.kKeyCodeDefault)
         UserDefaults.standard.set(Int(modifierMask.rawValue), forKey: Self.kModifierDefault)
     }
 
+    /// Human-readable chord, e.g. "⌥`". Reflects the live binding.
+    var displayString: String {
+        Self.describe(modifier: modifierMask, keyCode: triggerKeyCode)
+    }
+
+    /// Just the modifier portion, e.g. "⌥".
+    var modifierString: String {
+        var s = ""
+        if modifierMask.contains(.maskControl)   { s += "⌃" }
+        if modifierMask.contains(.maskAlternate) { s += "⌥" }
+        if modifierMask.contains(.maskShift)     { s += "⇧" }
+        if modifierMask.contains(.maskCommand)   { s += "⌘" }
+        return s
+    }
+
+    /// Just the trigger key portion, e.g. "`".
+    var triggerString: String { Self.keyName(triggerKeyCode) }
+
+    /// Format a modifier+keycode pair for display.
+    static func describe(modifier: CGEventFlags, keyCode: Int64) -> String {
+        var s = ""
+        if modifier.contains(.maskControl)   { s += "⌃" }
+        if modifier.contains(.maskAlternate) { s += "⌥" }
+        if modifier.contains(.maskShift)     { s += "⇧" }
+        if modifier.contains(.maskCommand)   { s += "⌘" }
+        s += keyName(keyCode)
+        return s
+    }
+
+    static func keyName(_ kc: Int64) -> String {
+        switch kc {
+        case 50:  return "`"
+        case 49:  return "Space"
+        case 36:  return "Return"
+        case 53:  return "Esc"
+        case 48:  return "Tab"
+        case 96:  return "F5"
+        case 97:  return "F6"
+        case 98:  return "F7"
+        case 100: return "F8"
+        case 101: return "F9"
+        default:  return "Key#\(kc)"
+        }
+    }
+
+    /// AX permission probe that does NOT show the system prompt — for UI status.
+    static var isAccessibilityTrusted: Bool { AXIsProcessTrusted() }
+
     private var tap: CFMachPort?
     private var runLoopSrc: CFRunLoopSource?
     private var modifierIsDown = false
     private var triggerIsDown = false
 
-    func start() {
-        guard tap == nil else { return }
-        // Trigger Accessibility prompt up-front so the user grants permission
-        // before the first chord press (otherwise the tap silently no-ops).
+    /// Create the event tap. Idempotent and retryable: if Accessibility
+    /// permission is missing, `tapCreate` fails, `isRunning` stays false, and a
+    /// later call (e.g. after the user grants permission) will succeed.
+    /// Returns true once the tap is live.
+    @discardableResult
+    func start() -> Bool {
+        if tap != nil {
+            isRunning = true
+            return true
+        }
+        // Trigger the Accessibility prompt up-front so the user grants
+        // permission before the first chord press (otherwise the tap silently
+        // no-ops). The prompt is shown at most once per app session.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         let trusted = AXIsProcessTrustedWithOptions(opts as CFDictionary)
         NSLog("[Chord] AX trusted = %{public}@", trusted ? "yes" : "no — prompted")
+
         let mask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue) |
             (1 << CGEventType.keyUp.rawValue) |
@@ -70,15 +146,18 @@ final class ChordMonitor {
             callback: chordTapCallback,
             userInfo: refcon
         ) else {
-            NSLog("[Chord] tapCreate failed — Accessibility permission missing?")
-            return
+            NSLog("[Chord] tapCreate failed — Accessibility permission missing. Will retry.")
+            isRunning = false
+            return false
         }
         self.tap = tap
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         self.runLoopSrc = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        isRunning = true
         NSLog("[Chord] event tap started")
+        return true
     }
 
     func stop() {
@@ -90,6 +169,7 @@ final class ChordMonitor {
             CGEvent.tapEnable(tap: tap, enable: false)
             self.tap = nil
         }
+        isRunning = false
     }
 
     /// Returns true if the event should be swallowed (consumed, not delivered
@@ -115,7 +195,10 @@ final class ChordMonitor {
                 NSLog("[Chord] captured kc=%lld mods=0x%llx", kc, mods.rawValue)
                 return true
             }
-            return false
+            // A bare key (no modifier) is not a valid chord — swallow it anyway
+            // so the focused app doesn't receive a stray keystroke while the
+            // user is mid-capture, and keep waiting for a real chord.
+            return true
         }
         switch type {
         case .flagsChanged:

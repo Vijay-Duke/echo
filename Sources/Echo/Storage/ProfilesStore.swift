@@ -1,6 +1,5 @@
 import Foundation
 import Combine
-import KeyboardShortcuts
 
 final class ProfilesStore: ObservableObject {
     @Published var profiles: [Profile] = []
@@ -30,30 +29,9 @@ final class ProfilesStore: ObservableObject {
         else {
             profiles = [Profile.defaultGemini()]
             save(profiles)
-            seedDefaultHotkeyIfNeeded()
             return
         }
         profiles = decoded
-        seedDefaultHotkeyIfNeeded()
-    }
-
-    /// On first launch, give the default profile a working hotkey so the user can
-    /// invoke the assistant without opening Settings first. ⌃⌥Space — chord includes
-    /// Ctrl to satisfy macOS Sequoia's modifier requirement, leaves ⌘Space alone.
-    private func seedDefaultHotkeyIfNeeded() {
-        guard userDefaults.bool(forKey: "defaultHotkeySeeded.v2") == false else { return }
-        guard let p = profiles.first(where: { $0.hotkeyName == "profile-quick" }) else { return }
-        let session = KeyboardShortcuts.Name(p.hotkeyName)
-        let talk = KeyboardShortcuts.Name(p.talkHotkeyName)
-        // Primary (session): ⌃` — hold to keep WSS alive.
-        if KeyboardShortcuts.getShortcut(for: session) == nil {
-            KeyboardShortcuts.setShortcut(.init(.backtick, modifiers: [.control]), for: session)
-        }
-        // Secondary (talk): ⌃Space — hold to talk, release to send + barge-in.
-        if KeyboardShortcuts.getShortcut(for: talk) == nil {
-            KeyboardShortcuts.setShortcut(.init(.space, modifiers: [.control]), for: talk)
-        }
-        userDefaults.set(true, forKey: "defaultHotkeySeeded.v2")
     }
 
     private func save(_ profiles: [Profile]) {
@@ -71,9 +49,6 @@ final class ProfilesStore: ObservableObject {
         var p = Profile.defaultGemini()
         p.id = UUID()
         p.name = "New Profile"
-        let suffix = p.id.uuidString.prefix(8)
-        p.hotkeyName = "profile-\(suffix)"
-        p.talkHotkeyName = "profile-\(suffix)-talk"
         profiles.append(p)
     }
 
@@ -88,10 +63,6 @@ final class ProfilesStore: ObservableObject {
 
     func move(from source: IndexSet, to destination: Int) {
         profiles.move(fromOffsets: source, toOffset: destination)
-    }
-
-    func profile(for hotkeyName: String) -> Profile? {
-        profiles.first { $0.hotkeyName == hotkeyName }
     }
 
     func binding(for id: UUID) -> Profile? {

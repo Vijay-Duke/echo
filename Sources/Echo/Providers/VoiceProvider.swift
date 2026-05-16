@@ -26,17 +26,19 @@ protocol VoiceProvider: AnyObject {
     /// Open WSS, configure session per profile.
     func connect(profile: Profile, apiKey: String) async throws
 
-    /// Send 16kHz PCM16 mono frame (~20-40ms).
-    func sendAudio(_ pcm16: Data) async throws
+    /// Enqueue a 16kHz PCM16 mono frame (~20-40ms). Synchronous + FIFO: callers
+    /// on a serial producer (the audio capture queue) get ordered delivery, so
+    /// audio frames and utterance markers never reach the server out of order.
+    func sendAudio(_ pcm16: Data)
 
-    /// Mark beginning of user utterance (manual VAD modes).
-    func startUtterance() async throws
+    /// Enqueue an utterance-start marker (manual VAD modes).
+    func startUtterance()
 
-    /// Mark end of user utterance — flush + request reply.
-    func endUtterance() async throws
+    /// Enqueue an utterance-end marker — flush + request reply.
+    func endUtterance()
 
     /// Cancel in-flight assistant audio.
-    func interrupt() async throws
+    func interrupt()
 
     /// Close socket + cleanup.
     func disconnect() async

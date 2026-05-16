@@ -19,7 +19,8 @@ cp "$BIN_PATH" "$CONTENTS/MacOS/$APP_NAME"
 cp Resources/Info.plist "$CONTENTS/Info.plist"
 cp Resources/AppIcon.icns "$CONTENTS/Resources/AppIcon.icns"
 
-# Copy SPM-generated resource bundles (Silero ONNX model lives in Echo_Echo.bundle).
+# Copy any SPM-generated resource bundles (none at present — loop kept so
+# future bundled resources are picked up automatically).
 BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 for bundle in "$BIN_DIR"/*.bundle; do
   [ -e "$bundle" ] || continue

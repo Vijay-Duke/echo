@@ -1,5 +1,5 @@
 import SwiftUI
-import KeyboardShortcuts
+import AppKit
 
 struct SettingsView: View {
     var body: some View {
@@ -24,6 +24,9 @@ private struct GeneralSettingsView: View {
 
     var body: some View {
         Form {
+            Section("Hotkey") {
+                HotkeyRecorderView()
+            }
             Section("Appearance") {
                 Toggle("Show in Dock", isOn: $showDockIcon)
                     .onChange(of: showDockIcon) { _, newValue in
@@ -63,6 +66,82 @@ private struct GeneralSettingsView: View {
                 AppController.shared?.warmShadowIfPossible()
             }
             .disabled(text.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+}
+
+// MARK: - Hotkey recorder
+
+/// A single app-wide chord editor. The chord is global — one press activates
+/// whichever profile is first-enabled — so this lives in General, not per-row.
+private struct HotkeyRecorderView: View {
+    // Mirrors `ChordMonitor`'s persisted binding; `@AppStorage` keeps the label
+    // in sync the moment `ChordMonitor.saveBinding()` writes a new chord.
+    @AppStorage("chord.keyCode.v1") private var keyCode: Int = 50
+    @AppStorage("chord.modifier.v1") private var modifierRaw: Int = Int(CGEventFlags.maskAlternate.rawValue)
+    @State private var capturing = false
+    @State private var tapRunning = false
+
+    private var label: String {
+        ChordMonitor.describe(modifier: CGEventFlags(rawValue: UInt64(modifierRaw)),
+                              keyCode: Int64(keyCode))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if tapRunning {
+                HStack(spacing: 8) {
+                    Text(capturing ? "Press chord…" : label)
+                        .font(.system(size: 13, design: .monospaced))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.controlBackgroundColor)))
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .stroke(capturing ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: 1))
+                    Button(capturing ? "Cancel" : "Record") { toggleCapture() }
+                }
+                Text("Hold the full chord to talk · release the trigger key to send · release the modifier to hibernate. A modifier (⌘/⌃/⌥/⇧) is required.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Label("Accessibility permission required", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.orange)
+                Text("Echo needs Accessibility access to capture the global hotkey. Grant it in System Settings, then click Re-check.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Open System Settings") { openAccessibilitySettings() }
+                    Button("Re-check") { recheck() }
+                }
+            }
+        }
+        .onAppear { recheck() }
+        .onDisappear { AppController.shared?.chord.onCapture = nil }
+    }
+
+    /// Try to (re)arm the event tap and reflect whether it is live.
+    private func recheck() {
+        tapRunning = AppController.shared?.chord.start() ?? false
+    }
+
+    private func toggleCapture() {
+        guard let chord = AppController.shared?.chord else { return }
+        if capturing {
+            chord.onCapture = nil
+            capturing = false
+            return
+        }
+        // Re-arm before recording — the tap may have failed at launch.
+        guard chord.start() else {
+            tapRunning = false
+            return
+        }
+        capturing = true
+        // `@AppStorage` picks up the new binding written by `saveBinding()`.
+        chord.onCapture = { _, _ in capturing = false }
+    }
+
+    private func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
     }
 }
@@ -139,8 +218,6 @@ private struct ProfileRow: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 200)
 
-                ChordBindingView()
-
                 Spacer()
 
                 Button(role: .destructive, action: onDelete) {
@@ -164,8 +241,6 @@ private struct ProfileRow: View {
                     }
                 }
                 .frame(maxWidth: 220)
-
-                Toggle("Inject clipboard", isOn: $profile.injectClipboard)
 
                 Toggle("Web search", isOn: Binding(
                     get: { profile.webSearchEnabled ?? false },
@@ -202,65 +277,6 @@ private struct ProfileRow: View {
     }
 }
 
-// MARK: - Chord binding
-
-private struct ChordBindingView: View {
-    @State private var label: String = ChordBindingView.formatBinding()
-    @State private var capturing: Bool = false
-
-    static func formatBinding() -> String {
-        let mods = UserDefaults.standard.integer(forKey: "chord.modifier.v1")
-        let kc = UserDefaults.standard.integer(forKey: "chord.keyCode.v1")
-        let modMask: UInt64 = mods == 0 ? CGEventFlags.maskAlternate.rawValue : UInt64(mods)
-        let keyCode = kc == 0 ? 50 : kc
-        var parts: [String] = []
-        if modMask & CGEventFlags.maskControl.rawValue   != 0 { parts.append("⌃") }
-        if modMask & CGEventFlags.maskAlternate.rawValue != 0 { parts.append("⌥") }
-        if modMask & CGEventFlags.maskShift.rawValue     != 0 { parts.append("⇧") }
-        if modMask & CGEventFlags.maskCommand.rawValue   != 0 { parts.append("⌘") }
-        parts.append(keyCodeToString(keyCode))
-        return parts.joined()
-    }
-
-    static func keyCodeToString(_ kc: Int) -> String {
-        switch kc {
-        case 50: return "`"
-        case 49: return "Space"
-        case 36: return "Return"
-        case 53: return "Esc"
-        case 48: return "Tab"
-        default: return "Key#\(kc)"
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Hotkey").font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 8) {
-                Text(capturing ? "Press chord…" : label)
-                    .font(.system(size: 13, design: .monospaced))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.controlBackgroundColor)))
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(capturing ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: 1))
-                Button(capturing ? "Cancel" : "Record") {
-                    if capturing {
-                        AppController.shared?.chord.onCapture = nil
-                        capturing = false
-                    } else {
-                        capturing = true
-                        AppController.shared?.chord.onCapture = { _, _ in
-                            label = ChordBindingView.formatBinding()
-                            capturing = false
-                        }
-                    }
-                }
-            }
-            Text("hold full chord to talk · release trigger to send · release modifier to hibernate")
-                .font(.caption2).foregroundStyle(.secondary)
-        }
-    }
-}
-
 // MARK: - About
 
 private struct AboutSettingsView: View {
@@ -274,7 +290,7 @@ private struct AboutSettingsView: View {
             Text("Voice-first assistant for macOS.")
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)
-            Text("v0.1.0")
+            Text("v1.0.3")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
